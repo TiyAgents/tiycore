@@ -191,12 +191,15 @@ fn detect_compat(model: &Model) -> OpenAICompletionsCompat {
             | Provider::DeepSeek
             | Provider::ZAI
             | Provider::OpenCode
+            | Provider::OpenAICompatible
+            | Provider::Zenmux
     ) || base_url.contains("cerebras.ai")
         || base_url.contains("api.x.ai")
         || base_url.contains("chutes.ai")
         || base_url.contains("deepseek.com")
         || base_url.contains("api.z.ai")
-        || base_url.contains("opencode.ai");
+        || base_url.contains("opencode.ai")
+        || base_url.contains("zenmux.ai");
     let use_max_tokens = base_url.contains("chutes.ai");
     let is_grok = matches!(model.provider, Provider::XAI) || base_url.contains("api.x.ai");
     let is_groq = matches!(model.provider, Provider::Groq) || base_url.contains("groq.com");

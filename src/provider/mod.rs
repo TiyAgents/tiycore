@@ -15,6 +15,7 @@ pub(crate) mod delegation;
 
 // Provider facades
 pub mod anthropic;
+pub mod bai;
 pub mod deepseek;
 pub mod google;
 pub mod groq;
@@ -63,5 +64,6 @@ pub fn register_all_providers() {
     register_provider(Arc::new(deepseek::DeepSeekProvider::new()));
     register_provider(Arc::new(xiaomi_mimo::XiaomiMIMOProvider::new()));
     register_provider(Arc::new(zenmux::ZenmuxProvider::new()));
+    register_provider(Arc::new(bai::BaiProvider::new()));
     register_provider(Arc::new(opencode_go::OpenCodeGoProvider::new()));
 }

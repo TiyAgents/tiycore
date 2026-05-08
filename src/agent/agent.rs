@@ -2198,6 +2198,14 @@ fn effective_api_for_model(model: &Model) -> Api {
                 Api::OpenAICompletions
             }
         }
+        Provider::Bai => {
+            let base = model.base_url.as_deref().unwrap_or("");
+            if base.is_empty() || base.starts_with(crate::provider::bai::BAI_HOST_PREFIX) {
+                crate::provider::bai::bai_detect_api(&model.id)
+            } else {
+                Api::OpenAICompletions
+            }
+        }
         Provider::XAI
         | Provider::Groq
         | Provider::OpenRouter
@@ -2250,6 +2258,58 @@ mod tests {
             effective_api_for_model(&zenmux_model(
                 "moonshotai/kimi-k2.5:anthropic",
                 Some("https://zenmux.ai/api/v1")
+            )),
+            Api::OpenAICompletions
+        );
+    }
+
+    fn bai_model(id: &str, base_url: Option<&str>) -> Model {
+        let mut builder = Model::builder()
+            .id(id)
+            .name(id)
+            .provider(Provider::Bai)
+            .context_window(128000)
+            .max_tokens(8192);
+        if let Some(base_url) = base_url {
+            builder = builder.base_url(base_url);
+        }
+        builder.build().unwrap()
+    }
+
+    #[test]
+    fn test_effective_api_for_bai_claude_models_uses_anthropic() {
+        assert_eq!(
+            effective_api_for_model(&bai_model("claude-sonnet-4", None)),
+            Api::AnthropicMessages
+        );
+        assert_eq!(
+            effective_api_for_model(&bai_model("claude-opus-4.6", None)),
+            Api::AnthropicMessages
+        );
+        assert_eq!(
+            effective_api_for_model(&bai_model("Claude-3.5-Sonnet", None)),
+            Api::AnthropicMessages
+        );
+    }
+
+    #[test]
+    fn test_effective_api_for_bai_non_claude_models_uses_openai_completions() {
+        assert_eq!(
+            effective_api_for_model(&bai_model("gpt-4o", None)),
+            Api::OpenAIResponses
+        );
+        assert_eq!(
+            effective_api_for_model(&bai_model("deepseek-r1", None)),
+            Api::OpenAICompletions
+        );
+    }
+
+    #[test]
+    fn test_effective_api_for_bai_custom_base_url_uses_openai_completions() {
+        assert_eq!(
+            effective_api_for_model(&bai_model(
+                "claude-sonnet-4",
+                Some("https://custom.example.com/v1")
             )),
             Api::OpenAICompletions
         );

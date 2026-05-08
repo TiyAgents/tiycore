@@ -4,6 +4,11 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.3] - 2026-05-01
+### :recycle: Refactors
+- [`74e54da`](https://github.com/TiyAgents/tiycore/commit/74e54daefb54c330e8cc4fd21666d09c4b1115ca) - ♻️ simplify code with Default derives and idiomatic Rust patterns *(commit by [@jorben](https://github.com/jorben))*
+
+
 ## [0.2.2] - 2026-04-28
 ### :sparkles: New Features
 - [`bd0565d`](https://github.com/TiyAgents/tiycore/commit/bd0565d62bef8b66a0cd6efd2296eae506af80a8) - **catalog**: ✨ add reasoning_content_constrained field to UnifiedModelInfo *(commit by [@jorben](https://github.com/jorben))*
@@ -255,3 +260,4 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 [0.2.1]: https://github.com/TiyAgents/tiycore/compare/0.2.0...0.2.1
 [0.2.2]: https://github.com/TiyAgents/tiycore/compare/0.2.1...0.2.2
 
+[0.2.3]: https://github.com/TiyAgents/tiycore/compare/0.2.2...0.2.3

@@ -183,6 +183,9 @@ pub enum Provider {
     /// Zenmux.
     #[serde(rename = "zenmux")]
     Zenmux,
+    /// BAI.
+    #[serde(rename = "bai")]
+    Bai,
     /// Ollama.
     #[serde(rename = "ollama")]
     Ollama,
@@ -222,6 +225,7 @@ impl Provider {
             Provider::DeepSeek => "deepseek",
             Provider::XiaomiMIMO => "xiaomi-mimo",
             Provider::Zenmux => "zenmux",
+            Provider::Bai => "bai",
             Provider::Ollama => "ollama",
             Provider::Custom(s) => s.as_str(),
         }
@@ -265,6 +269,7 @@ impl From<String> for Provider {
             "deepseek" => Provider::DeepSeek,
             "xiaomi-mimo" => Provider::XiaomiMIMO,
             "zenmux" => Provider::Zenmux,
+            "bai" => Provider::Bai,
             "ollama" => Provider::Ollama,
             _ => Provider::Custom(s),
         }
@@ -381,7 +386,7 @@ impl Default for OpenAICompletionsCompat {
     fn default() -> Self {
         Self {
             supports_store: true,
-            supports_developer_role: true,
+            supports_developer_role: false,
             supports_reasoning_effort: true,
             reasoning_effort_map: HashMap::new(),
             supports_usage_in_streaming: true,

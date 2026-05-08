@@ -295,7 +295,7 @@ fn test_model_serde_roundtrip() {
 fn test_openai_completions_compat_default() {
     let compat = OpenAICompletionsCompat::default();
     assert!(compat.supports_store);
-    assert!(compat.supports_developer_role);
+    assert!(!compat.supports_developer_role);
     assert!(compat.supports_reasoning_effort);
     assert!(compat.supports_usage_in_streaming);
     assert!(compat.supports_strict_mode);
