@@ -2219,7 +2219,8 @@ fn effective_api_for_model(model: &Model) -> Api {
         | Provider::HuggingFace
         | Provider::OpenCode
         | Provider::OpenCodeGo
-        | Provider::DeepSeek => Api::OpenAICompletions,
+        | Provider::DeepSeek
+        | Provider::XiaomiMIMO => Api::OpenAICompletions,
         Provider::AmazonBedrock => Api::BedrockConverseStream,
         Provider::Custom(name) => Api::Custom(name.clone()),
     }

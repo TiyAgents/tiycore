@@ -37,6 +37,7 @@ const MINIMAX_BASE_URL: &str = "https://api.minimax.io/anthropic/v1";
 const MINIMAX_CN_BASE_URL: &str = "https://api.minimaxi.com/anthropic/v1";
 const KIMI_CODING_BASE_URL: &str = "https://api.kimi.com/coding";
 const OPENCODE_GO_BASE_URL: &str = "https://opencode.ai/zen/go/v1";
+const XIAOMI_MIMO_BASE_URL: &str = "https://api.xiaomimimo.com/v1";
 const ANTHROPIC_VERSION: &str = "2023-06-01";
 const DEFAULT_CATALOG_MANIFEST_URL: &str =
     "https://tiyagents.github.io/tiycore/catalog/manifest.json";
@@ -1173,16 +1174,7 @@ impl ModelListAdapter for PredefinedModelsAdapter {
 
 fn adapter_for(provider: &Provider) -> Result<Box<dyn ModelListAdapter>, ModelCatalogError> {
     match provider {
-        Provider::OpenAI
-        | Provider::OpenAICompatible
-        | Provider::OpenAIResponses
-        | Provider::Google
-        | Provider::XAI
-        | Provider::Groq
-        | Provider::ZAI
-        | Provider::DeepSeek
-        | Provider::Bai
-        | Provider::Ollama => Ok(Box::new(ModelsEndpointAdapter::new(provider.clone()))),
+        // Providers with custom adapters
         Provider::OpenCodeGo => Ok(Box::new(PredefinedModelsAdapter::new(
             provider.clone(),
             opencode_go_predefined_models(),
@@ -1196,9 +1188,8 @@ fn adapter_for(provider: &Provider) -> Result<Box<dyn ModelListAdapter>, ModelCa
         Provider::Anthropic | Provider::KimiCoding => {
             Ok(Box::new(AnthropicModelsAdapter::new(provider.clone())))
         }
-        _ => Err(ModelCatalogError::UnsupportedProvider {
-            provider: provider.clone(),
-        }),
+        // Default: all other providers use the standard GET /models endpoint
+        _ => Ok(Box::new(ModelsEndpointAdapter::new(provider.clone()))),
     }
 }
 
@@ -1521,11 +1512,18 @@ fn provider_list_models_profile(
             auth_scheme: ProviderAuthScheme::Bearer,
             api_key_env_vars: &["OPENCODE_GO_API_KEY"],
         },
-        _ => {
-            return Err(ModelCatalogError::UnsupportedProvider {
-                provider: provider.clone(),
-            });
-        }
+        Provider::XiaomiMIMO => ProviderListModelsProfile {
+            default_base_url: Some(XIAOMI_MIMO_BASE_URL),
+            auth_scheme: ProviderAuthScheme::Bearer,
+            api_key_env_vars: &["XIAOMI_MIMO_API_KEY"],
+        },
+        // Default: assume Bearer auth with no known base URL or env var.
+        // Callers must provide base_url and api_key via the request.
+        _ => ProviderListModelsProfile {
+            default_base_url: None,
+            auth_scheme: ProviderAuthScheme::Bearer,
+            api_key_env_vars: &[],
+        },
     };
 
     Ok(profile)

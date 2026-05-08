@@ -135,6 +135,7 @@ fn create_default_provider(provider: &Provider) -> Option<ArcProtocol> {
         Provider::KimiCoding => Some(Arc::new(super::kimi_coding::KimiCodingProvider::new())),
         Provider::ZAI => Some(Arc::new(super::zai::ZAIProvider::new())),
         Provider::DeepSeek => Some(Arc::new(super::deepseek::DeepSeekProvider::new())),
+        Provider::XiaomiMIMO => Some(Arc::new(super::xiaomi_mimo::XiaomiMIMOProvider::new())),
         Provider::Zenmux => Some(Arc::new(super::zenmux::ZenmuxProvider::new())),
         Provider::Bai => Some(Arc::new(super::bai::BaiProvider::new())),
         Provider::OpenCodeGo => Some(Arc::new(super::opencode_go::OpenCodeGoProvider::new())),

@@ -273,12 +273,15 @@ async fn test_list_models_for_minimax_cn_uses_predefined_list() {
 
 #[tokio::test]
 async fn test_list_models_rejects_unimplemented_provider() {
+    // Providers without a known default base_url fall through to
+    // ModelsEndpointAdapter but fail with MissingBaseUrl when no
+    // base_url is provided in the request.
     let error = list_models(FetchModelsRequest::new(Provider::GoogleVertex))
         .await
-        .expect_err("google vertex should not be supported yet");
+        .expect_err("google vertex without base_url should fail");
 
     match error {
-        ModelCatalogError::UnsupportedProvider { provider } => {
+        ModelCatalogError::MissingBaseUrl { provider } => {
             assert_eq!(provider, Provider::GoogleVertex);
         }
         other => panic!("unexpected error: {other}"),

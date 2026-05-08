@@ -28,6 +28,7 @@ pub mod openai_responses;
 pub mod opencode_go;
 pub mod openrouter;
 pub mod xai;
+pub mod xiaomi_mimo;
 pub mod zai;
 pub mod zenmux;
 
@@ -61,6 +62,7 @@ pub fn register_all_providers() {
     register_provider(Arc::new(kimi_coding::KimiCodingProvider::new()));
     register_provider(Arc::new(zai::ZAIProvider::new()));
     register_provider(Arc::new(deepseek::DeepSeekProvider::new()));
+    register_provider(Arc::new(xiaomi_mimo::XiaomiMIMOProvider::new()));
     register_provider(Arc::new(zenmux::ZenmuxProvider::new()));
     register_provider(Arc::new(bai::BaiProvider::new()));
     register_provider(Arc::new(opencode_go::OpenCodeGoProvider::new()));
