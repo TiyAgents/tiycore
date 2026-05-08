@@ -1,0 +1,92 @@
+name: Code Reviewer Workflow
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+
+permissions:
+  contents: read
+  pull-requests: write
+  issues: write
+
+jobs:
+  review:
+    runs-on: ubuntu-latest
+    env:
+      LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
+    steps:
+      - name: Checkout Current Branch
+        uses: actions/checkout@v4
+
+      - name: Check LLM_API_KEY
+        if: ${{ env.LLM_API_KEY == '' }}
+        run: echo "LLM_API_KEY is not set. Skip self-test run."
+
+      - name: Run Action From Current Branch
+        if: ${{ env.LLM_API_KEY != '' }}
+        uses: TiyAgents/code-review-agent-action@v3
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          # Provider 配置
+          ai_provider: ${{ vars.LLM_PROVIDER_PROTOCOL }}
+          api_key: ${{ env.LLM_API_KEY }}
+          api_base: ${{ vars.LLM_API_BASE }}
+
+          # [可选] Planner 使用模型；默认 gpt-5.3-codex
+          planner_model: ${{ vars.PLANNER_MODEL }}
+
+          # [可选] SubAgent 使用模型；默认 gpt-5.3-codex
+          reviewer_model: ${{ vars.DEFAULT_MODEL }}
+
+          api_base_allowlist: |
+            api.openai.com
+            zenmux.ai
+            opencode.ai
+            openrouter.ai
+            tokenhub.tencentmaas.com
+            api.lkeap.cloud.tencent.com
+
+          # [Optional] Include globs
+          include: |
+            **/*.rs
+            **/*.toml
+            **/*.json
+
+          # [Optional] Exclude globs
+          exclude: |
+            **/*.lock
+            **/target/**
+            **/*.log
+
+          # [Optional] Review dimensions
+          review_dimensions: general,security,performance,testing
+
+          # [Optional] Review language
+          review_language: English
+
+          # [Optional] Minimum confidence to keep a finding
+          min_finding_confidence: 0.85
+
+          # [Optional] Coverage-first mode
+          coverage_first_round_primary_only: true
+
+          # [Optional] Auto-minimize outdated comments
+          auto_minimize_outdated_comments: true
+
+          # [Optional] Maximum review rounds
+          max_rounds: 4
+
+          # [Optional] Maximum model calls
+          max_model_calls: 64
+
+          # [Optional] Maximum files per batch
+          max_files_per_batch: 16
+
+          # [Optional] Maximum context characters per batch
+          max_context_chars: 256000
+
+          # [Optional] Maximum findings kept after aggregation
+          max_findings: 64
+
+          # [Optional] Maximum inline comments posted in PR review
+          max_inline_comments: 32
