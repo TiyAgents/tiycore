@@ -4,6 +4,16 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.5] - 2026-05-08
+### :sparkles: New Features
+- [`faa02b1`](https://github.com/TiyAgents/tiycore/commit/faa02b1781de49b2ecf98ba22d7215db6cdf2fbe) - **provider**: ✨ Add BAI provider with adaptive multi-protocol routing *(commit by [@jorben](https://github.com/jorben))*
+- [`20dc1f6`](https://github.com/TiyAgents/tiycore/commit/20dc1f6a1b2ffcfac133285127f019c87ebb5044) - **bai**: ✨ route GPT/OpenAI models to OpenAI Responses protocol *(commit by [@jorben](https://github.com/jorben))*
+- [`67d83d7`](https://github.com/TiyAgents/tiycore/commit/67d83d790fd47bd45e94a0af2edc674389656d45) - **provider**: ✨ Add Xiaomi MiMo as built-in provider *(PR [#29](https://github.com/TiyAgents/tiycore/pull/29) by [@jorben](https://github.com/jorben))*
+
+### :bug: Bug Fixes
+- [`91add3e`](https://github.com/TiyAgents/tiycore/commit/91add3e8ee096232157ffc4a615e7907afa9764e) - **compat**: 🐛 correct developer role default and extend compat detection *(commit by [@jorben](https://github.com/jorben))*
+
+
 ## [0.2.3] - 2026-05-01
 ### :recycle: Refactors
 - [`74e54da`](https://github.com/TiyAgents/tiycore/commit/74e54daefb54c330e8cc4fd21666d09c4b1115ca) - ♻️ simplify code with Default derives and idiomatic Rust patterns *(commit by [@jorben](https://github.com/jorben))*
@@ -261,3 +271,4 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 [0.2.2]: https://github.com/TiyAgents/tiycore/compare/0.2.1...0.2.2
 
 [0.2.3]: https://github.com/TiyAgents/tiycore/compare/0.2.2...0.2.3
+[0.2.5]: https://github.com/TiyAgents/tiycore/compare/0.2.3...0.2.5
