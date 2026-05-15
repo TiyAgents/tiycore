@@ -229,7 +229,7 @@ struct ResponsesReasoning {
 }
 
 fn supports_xhigh(model: &Model) -> bool {
-    model.id.contains("gpt-5.2") || model.id.contains("gpt-5.3") || model.id.contains("gpt-5.4")
+    super::common::supports_gpt5_xhigh(&model.id)
 }
 
 fn clamp_reasoning(level: ThinkingLevel, model: &Model) -> ThinkingLevel {
