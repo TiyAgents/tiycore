@@ -27,6 +27,7 @@ Stateful LLM conversation manager with autonomous tool execution loop. Thread-sa
    | Context Pipeline |
    |  transform_ctx   |
    |  convert_to_llm  |
+   |  on_messages     |
    |  build Context   |
    +--------+---------+
             |
@@ -75,7 +76,7 @@ Stateful LLM conversation manager with autonomous tool execution loop. Thread-sa
 | `AgentState` | `state.rs` | Thread-safe conversation state (messages, tools, streaming status) |
 | `AgentConfig` | `types.rs` | Configuration: model, thinking, security, transport, queue modes |
 | `AgentHooks` | `types.rs` | Aggregated hook container (tool executor, before/after hooks, pipeline fns) |
-| `AgentEvent` | `types.rs` | Event enum for the observer pattern (10 event types) |
+| `AgentEvent` | `types.rs` | Event enum for the observer pattern (12 event types) |
 | `AgentMessage` | `types.rs` | Tagged enum wrapping User/Assistant/ToolResult/Custom |
 
 ### Thread Safety Model
@@ -289,12 +290,25 @@ agent.set_on_payload(|payload: serde_json::Value, model: Model| async move {
 });
 ```
 
+#### onMessages
+
+Inspect or modify the typed `Message[]` right before serialization to the provider. Runs after `convertToLlm`.
+
+```rust
+use tiycore::types::Message;
+
+agent.set_on_messages(|messages: &[Message], model: &Model| async move {
+    // Log, filter, or mutate messages before they are sent
+    println!("Sending {} messages to {}", messages.len(), model.id);
+});
+```
+
 ### Context Pipeline
 
 The pipeline runs before each LLM call:
 
 ```
-state.messages  -->  transformContext  -->  convertToLlm  -->  Context
+state.messages  -->  transformContext  -->  convertToLlm  -->  onMessages  -->  Context
 ```
 
 #### transformContext
@@ -401,6 +415,12 @@ AgentStart
     MessageUpdate (Start)
     MessageUpdate (TextDelta) ...
     MessageUpdate (ToolCallDelta) ...
+    -- if stream ends incomplete --
+    MessageDiscarded (streamed message removed)
+    TurnRetrying { attempt, reason }
+    TurnStart  (retry from latest stable context)
+      ...
+    -- when stream completes --
     MessageStart  (finalized assistant message)
     MessageEnd
     ToolExecutionStart
@@ -447,6 +467,23 @@ agent.clear_steering_queue();
 agent.clear_follow_up_queue();
 agent.clear_all_queues();
 agent.has_queued_messages();  // true if either queue has items
+```
+
+#### Dynamic Queue Suppliers
+
+Instead of manually pushing messages with `steer()` / `follow_up()`, register callbacks that supply messages on demand. Called before each turn and after tool execution.
+
+```rust
+// Dynamic steering messages (checked during stream consumption and between tools)
+agent.set_get_steering_messages(|| async move {
+    // Read from an external queue, state, or network
+    vec![]
+});
+
+// Dynamic follow-up messages (checked after tool execution completes)
+agent.set_get_follow_up_messages(|| async move {
+    vec![]
+});
 ```
 
 ### Configuration
@@ -630,8 +667,17 @@ match agent.prompt("hello").await {
     Err(AgentError::CannotContinueFromAssistant) => {
         // continue_() called when last message is Assistant
     }
+    Err(AgentError::ToolNotFound(name)) => {
+        // LLM requested a tool that isn't registered
+    }
     Err(AgentError::ProviderError(msg)) => {
         // LLM returned an error (e.g., rate limit, invalid key)
+    }
+    Err(AgentError::IncompleteStream { provider, detail }) => {
+        // Stream ended without a valid assistant message
+    }
+    Err(AgentError::MaxTurnsReached(limit)) => {
+        // Agent hit the turn limit without producing a final response
     }
     Err(AgentError::Other(msg)) => {
         // "Aborted", stream timeout, etc.
@@ -738,10 +784,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 | `AgentConfig` | Model, thinking level, security, transport, queue modes. |
 | `AgentHooks` | Aggregated hook container for all Agent callbacks. |
 | `AgentMessage` | `User` / `Assistant` / `ToolResult` / `Custom` |
-| `AgentEvent` | 10-variant event enum for the observer pattern. |
+| `AgentEvent` | 12-variant event enum for the observer pattern. |
 | `AgentTool` | Tool definition with name, label, description, JSON Schema parameters. |
 | `AgentToolResult` | Tool execution result: content blocks + optional details. |
-| `AgentError` | Error enum: `AlreadyStreaming`, `NoMessages`, `ProviderError`, etc. |
+| `AgentError` | Error enum: `AlreadyStreaming`, `NoMessages`, `CannotContinueFromAssistant`, `ToolNotFound`, `ProviderError`, `IncompleteStream`, `MaxTurnsReached`, `Other`. |
 
 ### Hook Types
 
@@ -750,10 +796,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 | `BeforeToolCallFn` | `(BeforeToolCallContext) -> Future<Option<BeforeToolCallResult>>` | Gate tool execution |
 | `AfterToolCallFn` | `(AfterToolCallContext) -> Future<Option<AfterToolCallResult>>` | Override tool results |
 | `OnPayloadFn` | `(Value, Model) -> Future<Option<Value>>` | Inspect/replace HTTP body |
+| `OnMessagesFn` | `(&[Message], &Model) -> Future<()>` | Inspect/modify messages before serialization |
 | `ConvertToLlmFn` | `(Vec<AgentMessage>) -> Future<Vec<Message>>` | Custom message conversion |
 | `TransformContextFn` | `(Vec<AgentMessage>, AbortSignal) -> Future<Vec<AgentMessage>>` | Context pre-processing |
 | `GetApiKeyFn` | `(&str, AbortSignal) -> Future<Option<String>>` | Dynamic API key resolution |
 | `StreamFn` | `(&Model, &Context, SimpleStreamOptions, AbortSignal) -> Future<EventStream>` | Custom stream implementation |
+| `GetQueuedMessagesFn` | `() -> Future<Vec<AgentMessage>>` | Dynamic steering/follow-up message supplier |
 | `ToolUpdateCallback` | `(Value) -> ()` | Streaming tool progress |
 
 ### Configuration Types
@@ -766,6 +814,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 | `ThinkingBudgets` | `{ minimal, low, medium, high }` (all `Option<u32>`) |
 | `Transport` | `Sse` (default) / `WebSocket` / `Auto` |
 | `SecurityConfig` | `{ http, agent, stream, header_policy, url_policy }` |
+| `AgentConfig` | `{ model, thinking_level, tool_execution, security, steering_mode, follow_up_mode, thinking_budgets, transport, max_retries, max_retry_delay_ms, custom_headers }` |
 
 ### Event Types
 
@@ -773,11 +822,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 |-------|---------|---------|
 | `AgentStart` | -- | `prompt()` / `continue_()` begins |
 | `AgentEnd` | `messages: Vec<AgentMessage>` | Loop completes (success or error) |
-| `TurnStart` | -- | Each LLM call begins |
-| `TurnEnd` | `message, tool_results` | LLM call + tools complete |
-| `MessageStart` | `message` | Prompt, injected queue message, assistant stream start, or tool result committed |
-| `MessageUpdate` | `message, assistant_event` | Streaming deltas (text, thinking, tool call) |
-| `MessageEnd` | `message` | After `MessageStart` for the same committed message |
-| `ToolExecutionStart` | `tool_call_id, tool_name, args` | Before tool runs |
-| `ToolExecutionUpdate` | `tool_call_id, tool_name, args, partial_result` | Streaming tool progress |
-| `ToolExecutionEnd` | `tool_call_id, tool_name, result, is_error` | Tool finished (`result` includes `content` and optional `details`) |
+| `TurnStart` | `turn_index` | Each LLM call begins |
+| `TurnEnd` | `turn_index, message, tool_results` | LLM call + tools complete |
+| `MessageStart` | `turn_index, message` | Prompt, injected queue message, assistant stream start, or tool result committed |
+| `MessageUpdate` | `turn_index, message, assistant_event` | Streaming deltas (text, thinking, tool call) |
+| `MessageEnd` | `turn_index, response_id, message` | After `MessageStart` for the same committed message. `response_id` from the provider's response. |
+| `MessageDiscarded` | `turn_index, message, reason` | Previously streamed message removed from model state (e.g. incomplete turn retry) |
+| `ToolExecutionStart` | `turn_index, tool_call_id, tool_name, args` | Before tool runs |
+| `ToolExecutionUpdate` | `turn_index, tool_call_id, tool_name, args, partial_result` | Streaming tool progress |
+| `ToolExecutionEnd` | `turn_index, tool_call_id, tool_name, result, is_error` | Tool finished (`result` includes `content` and optional `details`) |
+| `TurnRetrying` | `attempt, max_attempts, delay_ms, reason` | Incomplete assistant turn is being retried from latest stable context |
