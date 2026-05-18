@@ -4,6 +4,11 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.6] - 2026-05-15
+### :recycle: Refactors
+- [`8454585`](https://github.com/tiylabs/tiycore/commit/84545850c360507ca1c3ca4ad305d69c8bbe907d) - ♻️ restructure OpenAICompletionsCompat into semantic sub-structs *(PR [#31](https://github.com/tiylabs/tiycore/pull/31) by [@jorben](https://github.com/jorben))*
+
+
 ## [0.2.5] - 2026-05-08
 ### :sparkles: New Features
 - [`faa02b1`](https://github.com/TiyAgents/tiycore/commit/faa02b1781de49b2ecf98ba22d7215db6cdf2fbe) - **provider**: ✨ Add BAI provider with adaptive multi-protocol routing *(commit by [@jorben](https://github.com/jorben))*
@@ -272,3 +277,4 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 [0.2.3]: https://github.com/TiyAgents/tiycore/compare/0.2.2...0.2.3
 [0.2.5]: https://github.com/TiyAgents/tiycore/compare/0.2.3...0.2.5
+[0.2.6]: https://github.com/tiylabs/tiycore/compare/0.2.5...0.2.6

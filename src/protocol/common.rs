@@ -113,6 +113,55 @@ pub fn clamp_openai_max_tokens(max_tokens: Option<u32>) -> Option<u32> {
     max_tokens.map(|value| value.max(16))
 }
 
+/// OpenAI GPT-5.2 and later versioned GPT-5 models support the native `xhigh`
+/// reasoning effort. Parse the dot-versioned model id by pattern instead of
+/// enumerating every future release (for example `gpt-5.5`, `gpt-5.6`, ...).
+pub(crate) fn supports_gpt5_xhigh(model_id: &str) -> bool {
+    let normalized = model_id.to_ascii_lowercase();
+    let mut search_start = 0;
+
+    while let Some(relative_start) = normalized[search_start..].find("gpt-5") {
+        let start = search_start + relative_start;
+        let end = start + "gpt-5".len();
+
+        let has_left_boundary = normalized[..start]
+            .chars()
+            .next_back()
+            .map(|ch| !ch.is_ascii_alphanumeric())
+            .unwrap_or(true);
+        if !has_left_boundary {
+            search_start = end;
+            continue;
+        }
+
+        let Some(separator) = normalized[end..].chars().next() else {
+            return false;
+        };
+        if separator != '.' {
+            search_start = end;
+            continue;
+        }
+
+        let minor_start = end + separator.len_utf8();
+        let minor_digits = normalized[minor_start..]
+            .chars()
+            .take_while(|ch| ch.is_ascii_digit())
+            .collect::<String>();
+        if minor_digits.is_empty() {
+            search_start = minor_start;
+            continue;
+        }
+
+        if minor_digits.parse::<u32>().is_ok_and(|minor| minor >= 2) {
+            return true;
+        }
+
+        search_start = minor_start + minor_digits.len();
+    }
+
+    false
+}
+
 /// Inject custom headers, skipping protected headers per security policy (H2).
 pub fn apply_custom_headers(
     headers: &mut HeaderMap,
@@ -717,6 +766,19 @@ pub(crate) fn normalize_reasoning_content(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_supports_gpt5_xhigh_matches_versioned_gpt5_2_and_later() {
+        assert!(supports_gpt5_xhigh("gpt-5.2"));
+        assert!(supports_gpt5_xhigh("gpt-5.5"));
+        assert!(supports_gpt5_xhigh("openai/gpt-5.6-mini"));
+        assert!(supports_gpt5_xhigh("GPT-5.10-CODEX"));
+
+        assert!(!supports_gpt5_xhigh("gpt-5"));
+        assert!(!supports_gpt5_xhigh("gpt-5.1"));
+        assert!(!supports_gpt5_xhigh("gpt-5-6"));
+        assert!(!supports_gpt5_xhigh("notgpt-5.6"));
+    }
 
     #[test]
     fn test_compute_retry_delay_zero_cap_disables_capping() {

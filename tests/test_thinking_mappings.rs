@@ -17,9 +17,13 @@ fn make_context(system_prompt: &str, user_msg: &str) -> Context {
 }
 
 fn make_openai_model(base_url: &str) -> Model {
+    make_openai_model_with_id(base_url, "gpt-5.4-mini")
+}
+
+fn make_openai_model_with_id(base_url: &str, id: &str) -> Model {
     Model::builder()
-        .id("gpt-5.4-mini")
-        .name("GPT-5.4 mini")
+        .id(id)
+        .name(id)
         .api(Api::OpenAIResponses)
         .provider(Provider::OpenAI)
         .base_url(base_url)
@@ -159,6 +163,92 @@ async fn test_openai_responses_stream_simple_maps_reasoning() {
                 ..Default::default()
             },
             reasoning: Some(ThinkingLevel::High),
+            thinking_budget_tokens: None,
+            thinking_display: None,
+        },
+    );
+
+    let result = stream.result().await;
+    assert_eq!(result.stop_reason, StopReason::Stop);
+    assert_eq!(result.text_content(), "done");
+}
+
+#[tokio::test]
+async fn test_openai_responses_stream_simple_keeps_xhigh_for_gpt5_5_and_later() {
+    let server = MockServer::start().await;
+    let sse_body = responses_sse(vec![
+        (
+            "response.output_item.added",
+            &json!({
+                "type": "response.output_item.added",
+                "output_index": 0,
+                "item": { "type": "message", "id": "item_1", "role": "assistant", "content": [] }
+            })
+            .to_string(),
+        ),
+        (
+            "response.output_text.delta",
+            &json!({
+                "type": "response.output_text.delta",
+                "output_index": 0,
+                "content_index": 0,
+                "delta": "done"
+            })
+            .to_string(),
+        ),
+        (
+            "response.output_item.done",
+            &json!({
+                "type": "response.output_item.done",
+                "output_index": 0,
+                "item": { "type": "message", "id": "item_1" }
+            })
+            .to_string(),
+        ),
+        (
+            "response.completed",
+            &json!({
+                "type": "response.completed",
+                "response": {
+                    "id": "resp_1",
+                    "status": "completed",
+                    "usage": { "input_tokens": 5, "output_tokens": 1 },
+                    "output": []
+                }
+            })
+            .to_string(),
+        ),
+    ]);
+
+    Mock::given(method("POST"))
+        .and(path("/responses"))
+        .and(body_partial_json(json!({
+            "reasoning": {
+                "effort": "xhigh",
+                "summary": "auto"
+            }
+        })))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string(sse_body)
+                .insert_header("content-type", "text/event-stream"),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let provider = OpenAIResponsesProtocol::new();
+    let model = make_openai_model_with_id(&server.uri(), "openai/gpt-5.5-mini");
+    let context = make_context("You are helpful.", "hello");
+    let stream = provider.stream_simple(
+        &model,
+        &context,
+        SimpleStreamOptions {
+            base: StreamOptions {
+                api_key: Some("key".into()),
+                ..Default::default()
+            },
+            reasoning: Some(ThinkingLevel::XHigh),
             thinking_budget_tokens: None,
             thinking_display: None,
         },
