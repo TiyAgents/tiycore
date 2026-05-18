@@ -341,7 +341,29 @@ async fn test_stream_retries_retryable_http_status_before_streaming() {
     options.max_retry_delay_ms = Some(10);
 
     let mut stream = provider.stream(&model, &context, options);
-    while stream.next().await.is_some() {}
+    let mut events = Vec::new();
+    while let Some(event) = stream.next().await {
+        events.push(event);
+    }
+
+    let retrying = events
+        .iter()
+        .find_map(|event| match event {
+            AssistantMessageEvent::Retrying {
+                attempt,
+                max_retries,
+                delay_ms,
+                reason,
+                status,
+            } => Some((*attempt, *max_retries, *delay_ms, reason.clone(), *status)),
+            _ => None,
+        })
+        .expect("expected retrying event after initial 503");
+    assert_eq!(retrying.0, 1);
+    assert_eq!(retrying.1, 1);
+    assert_eq!(retrying.2, 0);
+    assert!(retrying.3.contains("HTTP 503"));
+    assert_eq!(retrying.4, Some(503));
 
     let result = stream.result().await;
     assert_eq!(result.stop_reason, StopReason::Stop);

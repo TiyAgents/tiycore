@@ -552,14 +552,23 @@ pub async fn send_request_with_retry(
                 return Ok(None);
             }
             Ok(Some(response)) => {
-                if is_retryable_status(response.status()) && attempt < max_retries {
+                let status = response.status();
+                if is_retryable_status(status) && attempt < max_retries {
                     let delay = parse_retry_after(&response)
                         .map(|d| cap_retry_delay(d, max_retry_delay_ms))
                         .unwrap_or_else(|| compute_retry_delay(attempt, max_retry_delay_ms));
 
+                    stream.push(AssistantMessageEvent::Retrying {
+                        attempt: attempt + 1,
+                        max_retries,
+                        delay_ms: delay.as_millis() as u64,
+                        reason: format!("HTTP {}", status),
+                        status: Some(status.as_u16()),
+                    });
+
                     tracing::warn!(
                         url = %url,
-                        status = %response.status(),
+                        status = %status,
                         attempt = attempt + 1,
                         max_retries = max_retries,
                         delay_ms = delay.as_millis() as u64,
@@ -581,6 +590,14 @@ pub async fn send_request_with_retry(
             Err(e) => {
                 if is_retryable_error(&e) && attempt < max_retries {
                     let delay = compute_retry_delay(attempt, max_retry_delay_ms);
+
+                    stream.push(AssistantMessageEvent::Retrying {
+                        attempt: attempt + 1,
+                        max_retries,
+                        delay_ms: delay.as_millis() as u64,
+                        reason: e.to_string(),
+                        status: None,
+                    });
 
                     tracing::warn!(
                         url = %url,

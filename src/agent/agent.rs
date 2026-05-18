@@ -1114,6 +1114,25 @@ impl Agent {
                         });
                     }
                 }
+                AssistantMessageEvent::Retrying { .. } => {
+                    let message = self.state.stream_message.read().clone().unwrap_or_else(|| {
+                        AgentMessage::Assistant(
+                            AssistantMessage::builder()
+                                .api(effective_api_for_model(&model))
+                                .provider(model.provider.clone())
+                                .model(model.id.clone())
+                                .usage(Usage::default())
+                                .stop_reason(StopReason::Stop)
+                                .build()
+                                .expect("retrying assistant message should be buildable"),
+                        )
+                    });
+                    self.emit(AgentEvent::MessageUpdate {
+                        turn_index,
+                        message,
+                        assistant_event: Box::new(event.clone()),
+                    });
+                }
                 _ => {
                     if let Some(partial) = event.partial_message() {
                         self.emit(AgentEvent::MessageUpdate {
