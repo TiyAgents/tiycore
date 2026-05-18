@@ -40,7 +40,7 @@ const OPENCODE_GO_BASE_URL: &str = "https://opencode.ai/zen/go/v1";
 const XIAOMI_MIMO_BASE_URL: &str = "https://api.xiaomimimo.com/v1";
 const ANTHROPIC_VERSION: &str = "2023-06-01";
 const DEFAULT_CATALOG_MANIFEST_URL: &str =
-    "https://tiyagents.github.io/tiycore/catalog/manifest.json";
+    "https://tiylabs.github.io/tiycore/catalog/manifest.json";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ProviderAuthScheme {

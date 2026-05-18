@@ -177,8 +177,8 @@ You can verify the published GitHub Pages snapshot manually before wiring it
 into an application:
 
 ```bash
-curl -fsSL https://tiyagents.github.io/tiycore/catalog/manifest.json
-curl -fsSL https://tiyagents.github.io/tiycore/catalog/catalog.json -o /tmp/catalog.json
+curl -fsSL https://tiylabs.github.io/tiycore/catalog/manifest.json
+curl -fsSL https://tiylabs.github.io/tiycore/catalog/catalog.json -o /tmp/catalog.json
 python3 -m json.tool /tmp/catalog.json >/dev/null
 ```
 
