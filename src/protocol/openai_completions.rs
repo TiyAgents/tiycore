@@ -1293,9 +1293,10 @@ async fn run_stream(
             Err(err) => {
                 // Close any open content block before emitting the error
                 finish_current_block(&mut output, &stream, current_block.take());
-                super::common::emit_terminal_error(
+                super::common::emit_transport_stream_error(
                     &mut output,
-                    format!("OpenAI Completions stream transport error: {}", err),
+                    "openai_completions",
+                    err.to_string(),
                     limits.http.max_error_message_chars,
                     &stream,
                 );

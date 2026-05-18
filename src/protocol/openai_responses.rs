@@ -960,9 +960,10 @@ async fn run_stream(
                 continue;
             }
             Err(err) => {
-                super::common::emit_terminal_error(
+                super::common::emit_transport_stream_error(
                     &mut output,
-                    format!("OpenAI Responses stream transport error: {}", err),
+                    "openai_responses",
+                    err.to_string(),
                     limits.http.max_error_message_chars,
                     &stream,
                 );

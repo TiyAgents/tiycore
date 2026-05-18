@@ -1029,9 +1029,10 @@ async fn run_stream(
                     current_thinking_index,
                     current_text_index,
                 );
-                super::common::emit_terminal_error(
+                super::common::emit_transport_stream_error(
                     &mut output,
-                    format!("Google stream transport error: {}", err),
+                    "google",
+                    err.to_string(),
                     limits.http.max_error_message_chars,
                     &stream,
                 );
