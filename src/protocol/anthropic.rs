@@ -1128,6 +1128,13 @@ async fn run_stream(
                     delay_ms = delay.as_millis() as u64,
                     "Retryable Anthropic stream error before first semantic event, retrying request"
                 );
+                stream.push(AssistantMessageEvent::Retrying {
+                    attempt: prelude_retry_attempt + 1,
+                    max_retries,
+                    delay_ms: delay.as_millis() as u64,
+                    reason: err.to_string(),
+                    status: None,
+                });
                 if super::common::sleep_with_cancel(delay, cancel_token.as_ref()).await {
                     super::common::emit_aborted(&mut output, &stream);
                     return Ok(());
@@ -1187,9 +1194,10 @@ async fn run_stream(
                     thinking_indices,
                     text_indices,
                 );
-                super::common::emit_terminal_error(
+                super::common::emit_transport_stream_error(
                     &mut output,
-                    format!("Anthropic stream transport error: {}", err),
+                    "anthropic",
+                    err.to_string(),
                     limits.http.max_error_message_chars,
                     &stream,
                 );
@@ -1543,6 +1551,27 @@ async fn run_stream(
         return Ok(());
     }
 
+    // When the incomplete check returned None but message_delta was not
+    // received, the stream was tolerated as content-complete.  Infer the
+    // stop_reason from the content (tool_use if tool calls are present,
+    // otherwise normal stop) and emit a warning for observability.
+    if !saw_message_delta {
+        let inferred_reason = if output.has_tool_calls() {
+            StopReason::ToolUse
+        } else {
+            StopReason::Stop
+        };
+        tracing::warn!(
+            url = %url,
+            model = %model.id,
+            saw_message_stop = saw_message_stop,
+            inferred_stop_reason = %inferred_reason,
+            "Anthropic stream missing message_delta; content is complete, \
+             inferring stop_reason from delivered content blocks"
+        );
+        output.stop_reason = inferred_reason;
+    }
+
     stream.push(AssistantMessageEvent::Done {
         reason: output.stop_reason,
         message: output,
@@ -1588,6 +1617,28 @@ fn incomplete_anthropic_stream_detail(
     partial_tool_args: &HashMap<usize, String>,
     line_buffer: &str,
 ) -> Option<String> {
+    // Tolerate missing termination events when the content itself is complete.
+    // Some proxies, gateways, and Anthropic-compatible providers close the
+    // connection after delivering all content_block_stop events but omit the
+    // trailing message_delta / message_stop protocol frames.  When ALL of the
+    // following hold, the response is semantically complete and we should not
+    // treat it as an error:
+    //   1. All content blocks have been closed (open_blocks is empty).
+    //   2. No unfinished tool-call JSON fragments remain.
+    //   3. No trailing partial SSE frame in the line buffer.
+    //   4. At least one content block was received (block_types is non-empty).
+    // This mirrors the OpenAI Completions tolerance ([DONE] compensates for a
+    // missing finish_reason) and the Google tolerance (usage_metadata
+    // compensates for a missing candidate finish_reason).
+    if (!saw_message_delta || !saw_message_stop)
+        && !block_types.is_empty()
+        && open_blocks.is_empty()
+        && partial_tool_args.values().all(|args| args.trim().is_empty())
+        && line_buffer.trim().is_empty()
+    {
+        return None;
+    }
+
     let mut reasons = Vec::new();
 
     // When message_stop was received, tolerate a missing message_delta —
@@ -1734,6 +1785,142 @@ mod tests {
         assert!(detail.contains("unclosed content blocks at indices [1]"));
         assert!(detail.contains("unfinished tool input JSON at indices [1]"));
         assert!(detail.contains("trailing partial SSE frame"));
+    }
+
+    #[test]
+    fn test_incomplete_stream_tolerates_missing_termination_when_content_complete() {
+        // Scenario: All content blocks closed, no trailing data, but missing
+        // both message_delta and message_stop — should be tolerated (return None).
+        let detail = incomplete_anthropic_stream_detail(
+            false,
+            false,
+            &[BlockType::Text],
+            &HashSet::new(),
+            &HashMap::new(),
+            "",
+        );
+        assert!(
+            detail.is_none(),
+            "Expected tolerance when content is complete but termination events missing"
+        );
+    }
+
+    #[test]
+    fn test_incomplete_stream_tolerates_missing_message_stop_only() {
+        // Scenario: message_delta received but message_stop missing, content complete.
+        let detail = incomplete_anthropic_stream_detail(
+            true,
+            false,
+            &[BlockType::Text, BlockType::ToolUse],
+            &HashSet::new(),
+            &HashMap::new(),
+            "",
+        );
+        assert!(
+            detail.is_none(),
+            "Expected tolerance when only message_stop is missing and content is complete"
+        );
+    }
+
+    #[test]
+    fn test_incomplete_stream_no_tolerance_with_open_blocks() {
+        // Scenario: content block still open — should NOT be tolerated.
+        let mut open_blocks = HashSet::new();
+        open_blocks.insert(0);
+
+        let detail = incomplete_anthropic_stream_detail(
+            false,
+            false,
+            &[BlockType::Text],
+            &open_blocks,
+            &HashMap::new(),
+            "",
+        );
+        assert!(
+            detail.is_some(),
+            "Should report error when content blocks are still open"
+        );
+        let detail = detail.unwrap();
+        assert!(detail.contains("unclosed content blocks"));
+    }
+
+    #[test]
+    fn test_incomplete_stream_no_tolerance_with_trailing_sse_frame() {
+        // Scenario: all blocks closed but trailing partial SSE data remains.
+        let detail = incomplete_anthropic_stream_detail(
+            false,
+            false,
+            &[BlockType::Text],
+            &HashSet::new(),
+            &HashMap::new(),
+            "event: content_block_delta\ndata: {\"partial",
+        );
+        assert!(
+            detail.is_some(),
+            "Should report error when trailing SSE frame is present"
+        );
+        let detail = detail.unwrap();
+        assert!(detail.contains("trailing partial SSE frame"));
+    }
+
+    #[test]
+    fn test_incomplete_stream_no_tolerance_with_no_content() {
+        // Scenario: no content blocks were ever received (empty block_types).
+        let detail = incomplete_anthropic_stream_detail(
+            false,
+            false,
+            &[],
+            &HashSet::new(),
+            &HashMap::new(),
+            "",
+        );
+        assert!(
+            detail.is_some(),
+            "Should report error when no content was received at all"
+        );
+        let detail = detail.unwrap();
+        assert!(detail.contains("missing message_delta"));
+        assert!(detail.contains("missing message_stop"));
+    }
+
+    #[test]
+    fn test_incomplete_stream_no_tolerance_with_partial_tool_args() {
+        // Scenario: blocks closed but partial_tool_args has non-empty unfinished JSON.
+        let mut partial_tool_args = HashMap::new();
+        partial_tool_args.insert(0, "{\"path\":\"src".to_string());
+
+        let detail = incomplete_anthropic_stream_detail(
+            false,
+            false,
+            &[BlockType::ToolUse],
+            &HashSet::new(),
+            &partial_tool_args,
+            "",
+        );
+        assert!(
+            detail.is_some(),
+            "Should report error when partial tool args remain"
+        );
+    }
+
+    #[test]
+    fn test_incomplete_stream_tolerance_with_empty_partial_tool_args() {
+        // Scenario: partial_tool_args exists but with empty/whitespace value — tolerated.
+        let mut partial_tool_args = HashMap::new();
+        partial_tool_args.insert(0, "  ".to_string());
+
+        let detail = incomplete_anthropic_stream_detail(
+            false,
+            false,
+            &[BlockType::ToolUse],
+            &HashSet::new(),
+            &partial_tool_args,
+            "",
+        );
+        assert!(
+            detail.is_none(),
+            "Expected tolerance when partial_tool_args are empty/whitespace"
+        );
     }
 
     #[test]

@@ -258,6 +258,21 @@ async fn test_event_stream_result_multiple_waiters_complete() {
 }
 
 #[test]
+fn test_assistant_stream_retrying_event_does_not_complete() {
+    let stream = AssistantMessageEventStream::new_assistant_stream();
+
+    stream.push(AssistantMessageEvent::Retrying {
+        attempt: 1,
+        max_retries: 2,
+        delay_ms: 500,
+        reason: "HTTP 503 Service Unavailable".to_string(),
+        status: Some(503),
+    });
+
+    assert!(!stream.is_done());
+}
+
+#[test]
 fn test_assistant_stream_events_not_yielded_after_done() {
     let stream = AssistantMessageEventStream::new_assistant_stream();
 

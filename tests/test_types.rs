@@ -915,6 +915,15 @@ fn test_event_is_complete() {
     };
     assert!(error.is_complete());
 
+    let retrying = AssistantMessageEvent::Retrying {
+        attempt: 1,
+        max_retries: 2,
+        delay_ms: 500,
+        reason: "HTTP 503 Service Unavailable".to_string(),
+        status: Some(503),
+    };
+    assert!(!retrying.is_complete());
+
     let start = AssistantMessageEvent::Start { partial: msg };
     assert!(!start.is_complete());
 }
@@ -949,6 +958,58 @@ fn test_event_type_checks() {
         partial: msg,
     };
     assert!(tc.is_tool_call_event());
+
+    let retrying = AssistantMessageEvent::Retrying {
+        attempt: 1,
+        max_retries: 2,
+        delay_ms: 500,
+        reason: "timeout".to_string(),
+        status: None,
+    };
+    assert!(!retrying.is_text_event());
+    assert!(!retrying.is_thinking_event());
+    assert!(!retrying.is_tool_call_event());
+}
+
+#[test]
+fn test_retrying_event_helpers_and_serde() {
+    let event = AssistantMessageEvent::Retrying {
+        attempt: 1,
+        max_retries: 2,
+        delay_ms: 500,
+        reason: "HTTP 503 Service Unavailable".to_string(),
+        status: Some(503),
+    };
+
+    assert_eq!(event.partial_message(), None);
+    assert_eq!(event.content_index(), None);
+    assert_eq!(event.delta(), None);
+    assert_eq!(event.stop_reason(), None);
+
+    let json = serde_json::to_value(&event).unwrap();
+    assert_eq!(json["type"], "retrying");
+    assert_eq!(json["attempt"], 1);
+    assert_eq!(json["max_retries"], 2);
+    assert_eq!(json["delay_ms"], 500);
+    assert_eq!(json["reason"], "HTTP 503 Service Unavailable");
+    assert_eq!(json["status"], 503);
+
+    let back: AssistantMessageEvent = serde_json::from_value(json).unwrap();
+    assert_eq!(back, event);
+}
+
+#[test]
+fn test_retrying_event_omits_absent_status() {
+    let event = AssistantMessageEvent::Retrying {
+        attempt: 1,
+        max_retries: 2,
+        delay_ms: 500,
+        reason: "connection error".to_string(),
+        status: None,
+    };
+
+    let json = serde_json::to_value(&event).unwrap();
+    assert!(json.get("status").is_none());
 }
 
 #[test]

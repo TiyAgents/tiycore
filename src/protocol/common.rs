@@ -29,6 +29,10 @@ pub const DEFAULT_MAX_RETRY_DELAY_MS: u64 = 30_000;
 /// Prefix used to mark provider-side streams that ended before protocol closure.
 pub const INCOMPLETE_STREAM_ERROR_PREFIX: &str = "[incomplete_stream]";
 
+/// Prefix used to mark transport-level stream errors (connection reset, body
+/// decode failure, etc.) that interrupted an in-progress stream.
+pub const TRANSPORT_ERROR_PREFIX: &str = "[transport_error]";
+
 /// Base delay for exponential backoff in milliseconds.
 const RETRY_BASE_DELAY_MS: u64 = 500;
 
@@ -464,6 +468,38 @@ pub fn parse_incomplete_stream_error(error_message: &str) -> Option<(String, Str
     Some((provider.trim().to_string(), detail.trim().to_string()))
 }
 
+/// Emit a terminal error for a transport-level stream failure (connection
+/// reset, body decode error, timeout mid-stream, etc.).
+///
+/// The error message is prefixed with [`TRANSPORT_ERROR_PREFIX`] so the agent
+/// layer can distinguish transport errors from provider API errors and apply
+/// turn-level retry logic.
+pub fn emit_transport_stream_error(
+    output: &mut AssistantMessage,
+    provider: &str,
+    detail: impl Into<String>,
+    max_error_message_chars: usize,
+    stream: &AssistantMessageEventStream,
+) {
+    let detail = detail.into();
+    emit_terminal_error(
+        output,
+        format!(
+            "{TRANSPORT_ERROR_PREFIX}{provider}: {}",
+            crate::types::truncate_error_message(&detail, max_error_message_chars)
+        ),
+        max_error_message_chars,
+        stream,
+    );
+}
+
+/// Parse a transport-error marker back into `(provider, detail)`.
+pub fn parse_transport_stream_error(error_message: &str) -> Option<(String, String)> {
+    let payload = error_message.strip_prefix(TRANSPORT_ERROR_PREFIX)?;
+    let (provider, detail) = payload.split_once(':')?;
+    Some((provider.trim().to_string(), detail.trim().to_string()))
+}
+
 /// Emit `ThinkingEnd` and/or `TextEnd` events for any open content blocks
 /// before an error or incomplete-stream event is pushed.
 ///
@@ -601,14 +637,23 @@ pub async fn send_request_with_retry(
                 return Ok(None);
             }
             Ok(Some(response)) => {
-                if is_retryable_status(response.status()) && attempt < max_retries {
+                let status = response.status();
+                if is_retryable_status(status) && attempt < max_retries {
                     let delay = parse_retry_after(&response)
                         .map(|d| cap_retry_delay(d, max_retry_delay_ms))
                         .unwrap_or_else(|| compute_retry_delay(attempt, max_retry_delay_ms));
 
+                    stream.push(AssistantMessageEvent::Retrying {
+                        attempt: attempt + 1,
+                        max_retries,
+                        delay_ms: delay.as_millis() as u64,
+                        reason: format!("HTTP {}", status),
+                        status: Some(status.as_u16()),
+                    });
+
                     tracing::warn!(
                         url = %url,
-                        status = %response.status(),
+                        status = %status,
                         attempt = attempt + 1,
                         max_retries = max_retries,
                         delay_ms = delay.as_millis() as u64,
@@ -630,6 +675,14 @@ pub async fn send_request_with_retry(
             Err(e) => {
                 if is_retryable_error(&e) && attempt < max_retries {
                     let delay = compute_retry_delay(attempt, max_retry_delay_ms);
+
+                    stream.push(AssistantMessageEvent::Retrying {
+                        attempt: attempt + 1,
+                        max_retries,
+                        delay_ms: delay.as_millis() as u64,
+                        reason: e.to_string(),
+                        status: None,
+                    });
 
                     tracing::warn!(
                         url = %url,
@@ -776,5 +829,33 @@ mod tests {
     fn test_cap_retry_delay_zero_cap_is_unbounded() {
         let delay = Duration::from_secs(5);
         assert_eq!(cap_retry_delay(delay, 0), delay);
+    }
+
+    #[test]
+    fn test_parse_transport_stream_error_extracts_provider_and_detail() {
+        let msg = "[transport_error]anthropic: error decoding response body";
+        let (provider, detail) = parse_transport_stream_error(msg).unwrap();
+        assert_eq!(provider, "anthropic");
+        assert_eq!(detail, "error decoding response body");
+    }
+
+    #[test]
+    fn test_parse_transport_stream_error_returns_none_for_non_transport() {
+        assert!(parse_transport_stream_error("Provider error: something").is_none());
+        assert!(parse_transport_stream_error("[incomplete_stream]anthropic: missing message_stop").is_none());
+    }
+
+    #[test]
+    fn test_parse_incomplete_and_transport_are_mutually_exclusive() {
+        let transport_msg = "[transport_error]google: connection reset";
+        let incomplete_msg = "[incomplete_stream]google: missing message_stop";
+
+        // transport message should only match transport parser
+        assert!(parse_transport_stream_error(transport_msg).is_some());
+        assert!(parse_incomplete_stream_error(transport_msg).is_none());
+
+        // incomplete message should only match incomplete parser
+        assert!(parse_incomplete_stream_error(incomplete_msg).is_some());
+        assert!(parse_transport_stream_error(incomplete_msg).is_none());
     }
 }

@@ -1235,6 +1235,13 @@ async fn run_stream(
                     delay_ms = delay.as_millis() as u64,
                     "Retryable OpenAI Completions stream error before first semantic event, retrying request"
                 );
+                stream.push(AssistantMessageEvent::Retrying {
+                    attempt: prelude_retry_attempt + 1,
+                    max_retries,
+                    delay_ms: delay.as_millis() as u64,
+                    reason: err.to_string(),
+                    status: None,
+                });
                 if super::common::sleep_with_cancel(delay, cancel_token.as_ref()).await {
                     super::common::emit_aborted(&mut output, &stream);
                     return Ok(());
@@ -1286,9 +1293,10 @@ async fn run_stream(
             Err(err) => {
                 // Close any open content block before emitting the error
                 finish_current_block(&mut output, &stream, current_block.take());
-                super::common::emit_terminal_error(
+                super::common::emit_transport_stream_error(
                     &mut output,
-                    format!("OpenAI Completions stream transport error: {}", err),
+                    "openai_completions",
+                    err.to_string(),
                     limits.http.max_error_message_chars,
                     &stream,
                 );

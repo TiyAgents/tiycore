@@ -60,6 +60,20 @@ pub enum AssistantMessageEvent {
         tool_call: ToolCall,
         partial: AssistantMessage,
     },
+    /// Protocol-level retry is scheduled after a transient request or pre-stream error.
+    Retrying {
+        /// One-based retry attempt number.
+        attempt: u32,
+        /// Maximum number of retry attempts configured for this request.
+        max_retries: u32,
+        /// Delay before the next attempt, in milliseconds.
+        delay_ms: u64,
+        /// Human-readable retry reason, such as an HTTP status or transport error.
+        reason: String,
+        /// HTTP status code when retrying due to a response status.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        status: Option<u16>,
+    },
     /// Stream completed successfully.
     Done {
         reason: StopReason,
@@ -124,6 +138,7 @@ impl AssistantMessageEvent {
             AssistantMessageEvent::ToolCallStart { partial, .. } => Some(partial),
             AssistantMessageEvent::ToolCallDelta { partial, .. } => Some(partial),
             AssistantMessageEvent::ToolCallEnd { partial, .. } => Some(partial),
+            AssistantMessageEvent::Retrying { .. } => None,
             AssistantMessageEvent::Done { message, .. } => Some(message),
             AssistantMessageEvent::Error { error, .. } => Some(error),
         }

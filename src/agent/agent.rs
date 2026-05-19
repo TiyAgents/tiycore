@@ -1114,6 +1114,25 @@ impl Agent {
                         });
                     }
                 }
+                AssistantMessageEvent::Retrying { .. } => {
+                    let message = self.state.stream_message.read().clone().unwrap_or_else(|| {
+                        AgentMessage::Assistant(
+                            AssistantMessage::builder()
+                                .api(effective_api_for_model(&model))
+                                .provider(model.provider.clone())
+                                .model(model.id.clone())
+                                .usage(Usage::default())
+                                .stop_reason(StopReason::Stop)
+                                .build()
+                                .expect("retrying assistant message should be buildable"),
+                        )
+                    });
+                    self.emit(AgentEvent::MessageUpdate {
+                        turn_index,
+                        message,
+                        assistant_event: Box::new(event.clone()),
+                    });
+                }
                 _ => {
                     if let Some(partial) = event.partial_message() {
                         self.emit(AgentEvent::MessageUpdate {
@@ -1569,7 +1588,7 @@ impl Agent {
                             StopReason::Error | StopReason::Aborted
                         ) {
                             let agent_error = agent_error_from_assistant(&assistant_msg);
-                            if matches!(agent_error, AgentError::IncompleteStream { .. }) {
+                            if matches!(agent_error, AgentError::IncompleteStream { .. } | AgentError::TransportError { .. }) {
                                 let started_at = incomplete_turn_retry_started_at
                                     .get_or_insert_with(Instant::now);
                                 let retry_delay_ms = INCOMPLETE_TURN_RETRY_DELAYS_MS
@@ -2162,6 +2181,10 @@ fn agent_error_from_assistant(message: &AssistantMessage) -> AgentError {
                 crate::protocol::common::parse_incomplete_stream_error(&error_message)
             {
                 AgentError::IncompleteStream { provider, detail }
+            } else if let Some((provider, detail)) =
+                crate::protocol::common::parse_transport_stream_error(&error_message)
+            {
+                AgentError::TransportError { provider, detail }
             } else {
                 AgentError::ProviderError(error_message)
             }
@@ -2456,6 +2479,9 @@ pub enum AgentError {
 
     #[error("Incomplete {provider} stream: {detail}")]
     IncompleteStream { provider: String, detail: String },
+
+    #[error("Stream transport error ({provider}): {detail}")]
+    TransportError { provider: String, detail: String },
 
     #[error("Agent reached the maximum turn limit ({0}) before producing a final response")]
     MaxTurnsReached(usize),
