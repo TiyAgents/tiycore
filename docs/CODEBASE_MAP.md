@@ -107,10 +107,11 @@ src/
 │   ├── bai.rs ·············· BAI provider
 │   └── opencode_go.rs ······· OpenCodeGo
 │
-├── agent/ ····················· Stateful agent runtime (4 files)
+├── agent/ ····················· Stateful agent runtime (5 files)
 │   ├── agent.rs ············ Main Agent impl & agent_loop()
+│   ├── queue.rs ············ Unified message queue (MessageQueue, DrainStrategy, BackpressureConfig)
 │   ├── state.rs ············ AgentState & snapshots
-│   └── types.rs ············ Agent-specific types
+│   └── types.rs ············ Agent-specific types (QueueMode, QueueEvent, SupplierContext, etc.)
 │
 ├── stream/ ····················· Streaming utilities (3 files)
 │   ├── event_stream.rs ····· EventStream type
@@ -174,12 +175,13 @@ src/
 - `openrouter.rs`, `minimax.rs`, `kimi_coding.rs`, `zai.rs`
 - `deepseek.rs`, `xiaomi_mimo.rs`, `zenmux.rs`, `bai.rs`, `opencode_go.rs`
 
-### agent/ (4 files) — Stateful Agent Runtime
-**Responsibility**: Multi-turn conversations with tool execution
+### agent/ (5 files) — Stateful Agent Runtime
+**Responsibility**: Multi-turn conversations with tool execution, steering/follow-up queues
 
-- `agent.rs` — Agent struct, agent_loop(), event streaming
+- `agent.rs` — Agent struct, agent_loop(), event streaming, steering/follow-up consumption
+- `queue.rs` — MessageQueue (unified FIFO buffer + supplier), DrainStrategy trait, BackpressureConfig
 - `state.rs` — AgentState, AgentStateSnapshot (for persistence)
-- `types.rs` — Agent-specific event types
+- `types.rs` — Agent-specific event types, QueueMode, QueueEvent, QueueKind, QueueStats, SupplierContext
 
 ### stream/ (3 files) — Streaming Utilities
 **Responsibility**: SSE parsing and event buffering
@@ -293,6 +295,20 @@ pub async fn agent_loop_continue(
 pub struct AgentEventStream {
     // Streaming iterator of agent events
 }
+
+// Steering & Follow-up (runtime message injection)
+impl Agent {
+    pub fn steer(&self, msg: AgentMessage);              // Mid-stream interrupt
+    pub fn follow_up(&self, msg: AgentMessage);          // Post-turn append
+    pub fn try_steer(&self, msg: AgentMessage) -> Result<(), QueueFullError>;
+    pub fn has_queued_messages(&self) -> bool;            // Sync local check
+    pub async fn has_queued_messages_async(&self) -> bool; // Async with supplier probe
+    pub fn queue_stats(&self) -> QueueStats;
+    pub fn set_steering_mode(&self, mode: QueueMode);
+    pub fn set_on_queue_event<F>(&self, handler: F);
+    pub fn set_steering_supplier<F, Fut>(&self, supplier: F); // V2 with SupplierContext
+    pub fn set_steering_backpressure(&self, config: BackpressureConfig);
+}
 ```
 
 ---
@@ -301,7 +317,7 @@ pub struct AgentEventStream {
 
 | Category | Count | Details |
 |----------|-------|---------|
-| **Total .rs Files** | 54 | Including lib.rs, bin, src/types/protocol/provider/agent/etc |
+| **Total .rs Files** | 55 | Including lib.rs, bin, src/types/protocol/provider/agent/etc |
 | **Total Lines of Code** | ~21,000 | Across all Rust source files |
 | **Main Modules** | 11 | types, protocol, provider, agent, stream, transform, validation, thinking, models, catalog, bin |
 | **Supported Providers** | 18+ | OpenAI, Anthropic, Google, Ollama, Groq, etc. |
@@ -418,7 +434,7 @@ let response = protocol.parse_response(&response_body)?;
 - **src/types/** — 8 files
 - **src/protocol/** — 7 files
 - **src/provider/** — 20 files
-- **src/agent/** — 4 files
+- **src/agent/** — 5 files
 - **src/stream/** — 3 files
 - **src/transform/** — 3 files
 - **src/validation/** — 2 files

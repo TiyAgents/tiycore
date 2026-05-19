@@ -24,10 +24,11 @@ tiycore/
 │   │   ├── limits.rs               ← Resource limits
 │   │   └── mod.rs                  ← Aggregator
 │   │
-│   ├── agent/ (4 files, ~2,500 LOC)
+│   ├── agent/ (5 files, ~3,200 LOC)
 │   │   ├── agent.rs                ← Agent main loop logic
+│   │   ├── queue.rs                ← Unified message queue (MessageQueue, DrainStrategy, Backpressure)
 │   │   ├── state.rs                ← AgentState, AgentStateSnapshot
-│   │   ├── types.rs                ← Agent-specific types
+│   │   ├── types.rs                ← Agent-specific types (QueueMode, QueueEvent, SupplierContext)
 │   │   └── mod.rs                  ← Aggregator
 │   │
 │   ├── protocol/ (7 files, ~2,000+ LOC)
