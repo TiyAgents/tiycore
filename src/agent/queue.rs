@@ -186,6 +186,10 @@ impl MessageQueue {
     }
 
     /// Push multiple messages into the queue.
+    ///
+    /// This bulk path intentionally bypasses backpressure. It is used to cache
+    /// messages that were already produced by dynamic suppliers; callers that
+    /// need backpressure enforcement should use [`MessageQueue::try_push`].
     #[allow(dead_code)]
     pub fn push_many(&self, messages: impl IntoIterator<Item = AgentMessage>) {
         let mut buf = self.buffer.lock();
@@ -390,14 +394,29 @@ mod tests {
         assert_eq!(q.len(), 3);
     }
 
+    #[test]
+    fn test_push_many_bypasses_backpressure() {
+        let q = MessageQueue::new(QueueKind::FollowUp);
+        q.set_backpressure(BackpressureConfig {
+            max_depth: 1,
+            overflow: OverflowBehavior::Reject,
+        });
+
+        q.push_many(vec![make_msg("a"), make_msg("b"), make_msg("c")]);
+        assert_eq!(q.len(), 3);
+
+        let err = q.try_push(make_msg("d")).unwrap_err();
+        assert_eq!(err.current_depth, 3);
+        assert_eq!(err.max_depth, 1);
+    }
+
     #[tokio::test]
     async fn test_drain_with_supplier_all_mode() {
         let q = MessageQueue::new(QueueKind::Steering);
         q.push(make_msg("local"));
 
-        let supplier: GetQueuedMessagesFn = Arc::new(|_signal| {
-            Box::pin(async { vec![AgentMessage::from("dynamic")] })
-        });
+        let supplier: GetQueuedMessagesFn =
+            Arc::new(|_signal| Box::pin(async { vec![AgentMessage::from("dynamic")] }));
 
         let abort = AbortSignal::new();
         let result = q.drain(QueueMode::All, &Some(supplier), abort).await;
@@ -409,14 +428,11 @@ mod tests {
         let q = MessageQueue::new(QueueKind::Steering);
         q.push(make_msg("local"));
 
-        let supplier: GetQueuedMessagesFn = Arc::new(|_signal| {
-            Box::pin(async { vec![AgentMessage::from("dynamic")] })
-        });
+        let supplier: GetQueuedMessagesFn =
+            Arc::new(|_signal| Box::pin(async { vec![AgentMessage::from("dynamic")] }));
 
         let abort = AbortSignal::new();
-        let result = q
-            .drain(QueueMode::OneAtATime, &Some(supplier), abort)
-            .await;
+        let result = q.drain(QueueMode::OneAtATime, &Some(supplier), abort).await;
         // Local has message, so supplier is NOT called; only 1 local msg returned
         assert_eq!(result.len(), 1);
     }
@@ -431,11 +447,34 @@ mod tests {
         });
 
         let abort = AbortSignal::new();
-        let result = q
-            .drain(QueueMode::OneAtATime, &Some(supplier), abort)
-            .await;
+        let result = q.drain(QueueMode::OneAtATime, &Some(supplier), abort).await;
         // Supplier returns 2, but OneAtATime takes only 1
         assert_eq!(result.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_drain_all_with_empty_local_uses_supplier_only() {
+        let q = MessageQueue::new(QueueKind::Steering);
+
+        let supplier: GetQueuedMessagesFn =
+            Arc::new(|_signal| Box::pin(async { vec![AgentMessage::from("dynamic")] }));
+
+        let abort = AbortSignal::new();
+        let result = q.drain(QueueMode::All, &Some(supplier), abort).await;
+        assert_eq!(result, vec![AgentMessage::from("dynamic")]);
+        assert!(q.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_drain_one_at_a_time_empty_supplier_returns_empty() {
+        let q = MessageQueue::new(QueueKind::Steering);
+
+        let supplier: GetQueuedMessagesFn = Arc::new(|_signal| Box::pin(async { Vec::new() }));
+
+        let abort = AbortSignal::new();
+        let result = q.drain(QueueMode::OneAtATime, &Some(supplier), abort).await;
+        assert!(result.is_empty());
+        assert!(q.is_empty());
     }
 
     #[tokio::test]
