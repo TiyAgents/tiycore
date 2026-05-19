@@ -327,6 +327,7 @@ impl MessageQueue {
 mod tests {
     use super::*;
     use crate::agent::AgentMessage;
+    use crate::types::UserContent;
     use std::sync::Arc;
 
     fn make_msg(text: &str) -> AgentMessage {
@@ -535,10 +536,20 @@ mod tests {
         assert!(q.try_push(make_msg("d")).is_ok());
         assert_eq!(q.len(), 3);
 
-        // Drain and check oldest was dropped
+        // Drain and verify oldest was dropped, remainder order preserved
         let msgs = q.drain_local(QueueMode::All);
         assert_eq!(msgs.len(), 3);
-        // "a" was dropped, should have b, c, d
+        let texts: Vec<&str> = msgs
+            .iter()
+            .filter_map(|m| match m {
+                AgentMessage::User(u) => match &u.content {
+                    UserContent::Text(t) => Some(t.as_str()),
+                    _ => None,
+                },
+                _ => None,
+            })
+            .collect();
+        assert_eq!(texts, vec!["b", "c", "d"]);
     }
 
     #[test]
