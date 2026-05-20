@@ -127,9 +127,17 @@ impl QueueMode {
 ///
 /// Controls behavior when the queue depth exceeds limits.
 /// Default is `Unlimited` (no restriction), preserving backward compatibility.
+///
+/// **Important:** When `max_depth` is `0`, the queue is unbounded regardless of
+/// the `overflow` setting. A `max_depth` of zero is treated as "no limit" —
+/// the `overflow` field is only consulted when `max_depth > 0`. If you need
+/// backpressure, always set `max_depth` to a positive value.
 #[derive(Debug, Clone)]
 pub struct BackpressureConfig {
-    /// Maximum queue depth. 0 = unlimited (default).
+    /// Maximum queue depth. `0` means unlimited (default).
+    ///
+    /// When `max_depth == 0`, the `overflow` field is ignored and the queue
+    /// grows without bound. Set to a positive value to enforce backpressure.
     pub max_depth: usize,
     /// What to do when the limit is exceeded.
     pub overflow: OverflowBehavior,
@@ -253,6 +261,10 @@ impl MessageQueue {
     ///
     /// With `DropOldest`, oldest messages are evicted to make room.
     /// With `Unlimited`, always succeeds (equivalent to `push()`).
+    ///
+    /// **Note:** When `max_depth == 0`, the queue is unbounded and this method
+    /// always succeeds — the `overflow` field is not consulted. See
+    /// [`BackpressureConfig`] for details.
     pub fn try_push(&self, message: AgentMessage) -> Result<QueuedMessageId, QueueFullError> {
         let bp = self.backpressure.lock().clone();
         let item = self.make_item(message);
@@ -732,5 +744,58 @@ mod tests {
         let result2 = strategy2.select(&mut buf2);
         assert_eq!(result2.len(), 1);
         assert_eq!(buf2.len(), 1);
+    }
+
+    // ========== max_depth=0 boundary tests ==========
+
+    /// When max_depth is 0 and overflow is Reject, the queue is still
+    /// unbounded — max_depth=0 means "no limit" regardless of overflow.
+    #[test]
+    fn test_backpressure_zero_depth_with_reject_still_unlimited() {
+        let q = MessageQueue::new(QueueKind::Steering);
+        q.set_backpressure(BackpressureConfig {
+            max_depth: 0,
+            overflow: OverflowBehavior::Reject,
+        });
+        // Should accept all messages despite Reject — max_depth=0 overrides.
+        for i in 0..100 {
+            assert!(
+                q.try_push(make_msg(&format!("msg{}", i))).is_ok(),
+                "try_push should succeed when max_depth=0 even with Reject"
+            );
+        }
+        assert_eq!(q.len(), 100);
+    }
+
+    /// When max_depth is 0 and overflow is DropOldest, the queue is still
+    /// unbounded — max_depth=0 means "no limit" regardless of overflow.
+    #[test]
+    fn test_backpressure_zero_depth_with_drop_oldest_still_unlimited() {
+        let q = MessageQueue::new(QueueKind::Steering);
+        q.set_backpressure(BackpressureConfig {
+            max_depth: 0,
+            overflow: OverflowBehavior::DropOldest,
+        });
+        // Should accept all messages — no eviction when max_depth=0.
+        for i in 0..100 {
+            assert!(
+                q.try_push(make_msg(&format!("msg{}", i))).is_ok(),
+                "try_push should succeed when max_depth=0 even with DropOldest"
+            );
+        }
+        assert_eq!(q.len(), 100);
+        // Verify first message is still present (no eviction occurred).
+        let msgs = q.drain_local(QueueMode::All);
+        let texts: Vec<&str> = msgs
+            .iter()
+            .filter_map(|m| match m {
+                AgentMessage::User(u) => match &u.content {
+                    UserContent::Text(t) => Some(t.as_str()),
+                    _ => None,
+                },
+                _ => None,
+            })
+            .collect();
+        assert_eq!(texts.first(), Some(&"msg0"));
     }
 }
