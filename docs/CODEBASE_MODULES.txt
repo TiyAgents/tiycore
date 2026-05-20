@@ -21,10 +21,10 @@
           ▼                                                              ▼
 ┌──────────────────────────────────┐                    ┌──────────────────────────┐
 │   TYPES MODULE (Core Types)      │                    │   AGENT MODULE           │
-│  src/types/ (7 files, 1,800 LOC) │                    │ src/agent/ (4 files)    │
+│  src/types/ (7 files, 1,800 LOC) │                    │ src/agent/ (5 files)    │
 │                                  │                    │                          │
 │ ┌──────────────────────────────┐ │                    │ ┌──────────────────────┐ │
-│ │ context.rs (403 lines)       │ │                    │ │ agent.rs (~2000 LOC) │ │
+│ │ context.rs (403 lines)       │ │                    │ │ agent.rs (~2700 LOC) │ │
 │ ├──────────────────────────────┤ │                    │ ├──────────────────────┤ │
 │ │ • Context                    │ │                    │ │ • Agent              │ │
 │ │   ├─ system_prompt           │ │                    │ │ • AgentLoop          │ │

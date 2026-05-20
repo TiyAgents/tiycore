@@ -16,6 +16,8 @@
 
 tiycore 是一个 Rust 库，提供统一的、与提供商无关的流式 LLM 补全接口，以及自主的 Agent 工具调用循环。只需编写一次应用逻辑，即可通过修改配置在 OpenAI、Anthropic、Google、Ollama 及 9+ 个其他提供商之间自由切换。
 
+<img width="2752" height="1536" alt="image" src="https://github.com/user-attachments/assets/f3d29f85-0ef0-4674-a159-4760e1876780" />
+
 ## 核心特性
 
 - **一套接口，多个提供商** — 5 个协议级实现（OpenAI Completions、OpenAI Responses、Anthropic Messages、Google Generative AI / Vertex AI、Ollama）和 10 个代理提供商（OpenAI-Compatible、xAI、Groq、OpenRouter、DeepSeek、MiniMax、Kimi Coding、ZAI、Zenmux、OpenCode Go），统一在单一 `LLMProtocol` trait 之下。

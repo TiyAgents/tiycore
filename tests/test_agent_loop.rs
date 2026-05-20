@@ -93,6 +93,83 @@ impl LLMProtocol for MockProvider {
     }
 }
 
+/// A mock LLM provider that records the request contexts for each call.
+struct RecordingProvider {
+    responses: parking_lot::Mutex<Vec<AssistantMessage>>,
+    contexts: parking_lot::Mutex<Vec<Vec<Message>>>,
+    call_count: AtomicUsize,
+}
+
+impl RecordingProvider {
+    fn new(responses: Vec<AssistantMessage>) -> Self {
+        Self {
+            responses: parking_lot::Mutex::new(responses),
+            contexts: parking_lot::Mutex::new(Vec::new()),
+            call_count: AtomicUsize::new(0),
+        }
+    }
+
+    fn call_count(&self) -> usize {
+        self.call_count.load(Ordering::SeqCst)
+    }
+
+    fn contexts(&self) -> Vec<Vec<Message>> {
+        self.contexts.lock().clone()
+    }
+}
+
+#[async_trait]
+impl LLMProtocol for RecordingProvider {
+    fn provider_type(&self) -> Provider {
+        Provider::OpenAI
+    }
+
+    fn stream(
+        &self,
+        _model: &Model,
+        context: &Context,
+        _options: StreamOptions,
+    ) -> AssistantMessageEventStream {
+        self.call_count.fetch_add(1, Ordering::SeqCst);
+        self.contexts.lock().push(context.messages.clone());
+
+        let stream = AssistantMessageEventStream::new_assistant_stream();
+
+        let mut responses = self.responses.lock();
+        let response = if responses.is_empty() {
+            let mut msg = make_assistant_message("Default response");
+            msg.stop_reason = StopReason::Stop;
+            msg
+        } else {
+            responses.remove(0)
+        };
+
+        let stop_reason = response.stop_reason;
+        let response_clone = response.clone();
+        let stream_clone = stream.clone();
+        tokio::spawn(async move {
+            stream_clone.push(AssistantMessageEvent::Start {
+                partial: response_clone.clone(),
+            });
+            stream_clone.push(AssistantMessageEvent::Done {
+                reason: stop_reason,
+                message: response_clone,
+            });
+            stream_clone.end(None);
+        });
+
+        stream
+    }
+
+    fn stream_simple(
+        &self,
+        model: &Model,
+        context: &Context,
+        options: SimpleStreamOptions,
+    ) -> AssistantMessageEventStream {
+        self.stream(model, context, options.base)
+    }
+}
 // ============================================================================
 // Helper Functions
 // ============================================================================
@@ -136,6 +213,16 @@ fn make_tool_call_message(
         .stop_reason(StopReason::ToolUse)
         .build()
         .unwrap()
+}
+
+fn messages_contain_user_text(messages: &[Message], expected: &str) -> bool {
+    messages.iter().any(|message| {
+        matches!(
+            message,
+            Message::User(user)
+                if matches!(&user.content, UserContent::Text(text) if text == expected)
+        )
+    })
 }
 
 // ============================================================================
@@ -507,7 +594,7 @@ async fn test_agent_abort_resets_state() {
 
 #[tokio::test]
 async fn test_agent_follow_up_processed() {
-    // First response is text (no tool call) but a follow-up is queued
+    // First response is text (no tool call) but a follow-up is queued.
     let response1 = make_assistant_message("First response");
     let response2 = make_assistant_message("Second response");
     let mock_provider = Arc::new(MockProvider::new(vec![response1, response2]));
@@ -516,17 +603,55 @@ async fn test_agent_follow_up_processed() {
     let agent = Agent::with_model(make_model());
     agent.set_provider(provider);
 
-    // Queue a follow-up before prompting
+    // Queue a follow-up before prompting.
     agent.follow_up(AgentMessage::User(UserMessage::text("Follow-up question")));
 
     let result = agent.prompt(UserMessage::text("Hello")).await;
     assert!(result.is_ok());
 
-    // The follow-up should have triggered a second turn
-    // Note: Follow-ups are processed after tool calls or final response
-    // With the current implementation, follow-ups after a non-tool-call response
-    // trigger another turn
+    // A follow-up after a completed non-tool task should trigger another turn.
     assert!(mock_provider.call_count() >= 1);
+}
+
+#[tokio::test]
+async fn test_agent_follow_up_waits_until_current_tool_task_completes() {
+    let provider = Arc::new(RecordingProvider::new(vec![
+        make_tool_call_message("my_tool", "call_1", json!({})),
+        make_assistant_message("Current task complete"),
+        make_assistant_message("Follow-up handled"),
+    ]));
+    let arc_provider: ArcProtocol = provider.clone();
+
+    let agent = Agent::with_model(make_model());
+    agent.set_provider(arc_provider);
+    agent.set_tool_execution(ToolExecutionMode::Sequential);
+    agent.set_tool_executor_simple(
+        |_name: &str, _id: &str, _args: &serde_json::Value| async move {
+            AgentToolResult::text("tool result")
+        },
+    );
+
+    agent.follow_up(AgentMessage::User(UserMessage::text("Queued follow-up")));
+
+    let result = agent.prompt(UserMessage::text("Start task")).await;
+    assert!(result.is_ok());
+
+    assert_eq!(
+        provider.call_count(),
+        3,
+        "initial task, current task completion, and follow-up should each call the provider"
+    );
+
+    let contexts = provider.contexts();
+    assert_eq!(contexts.len(), 3);
+    assert!(
+        !messages_contain_user_text(&contexts[1], "Queued follow-up"),
+        "follow-up must not be consumed immediately after the tool-call boundary"
+    );
+    assert!(
+        messages_contain_user_text(&contexts[2], "Queued follow-up"),
+        "follow-up should be consumed after the current task's final assistant response"
+    );
 }
 
 // ============================================================================

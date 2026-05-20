@@ -45,7 +45,7 @@ Visual diagram showing how modules relate and depend on each other. Includes:
 | Metric | Value |
 |--------|-------|
 | **Total Lines of Code** | ~21,000 Rust LOC |
-| **Source Files** | 51 .rs files |
+| **Source Files** | 55 .rs files |
 | **Main Modules** | 10 (types, agent, protocol, provider, stream, transform, catalog, models, thinking, validation) |
 | **Supported Providers** | 17+ LLM providers |
 | **Language** | Rust 2021 Edition |
@@ -60,7 +60,7 @@ Visual diagram showing how modules relate and depend on each other. Includes:
 src/
 ├── lib.rs (82 LOC)              ← Library root
 ├── types/ (7 files, 1,800 LOC)  ← Core data model: Context, Message, ContentBlock, Tool
-├── agent/ (4 files, 2,500 LOC)  ← Stateful agent runtime
+├── agent/ (5 files, 3,200 LOC)  ← Stateful agent runtime + queue system
 ├── protocol/ (7 files, 2,000 LOC) ← Wire format implementations (OpenAI, Anthropic, Google)
 ├── provider/ (18 files, 3,000 LOC) ← Provider facades + registry
 ├── stream/ (3 files, 500 LOC)   ← Event streaming (SSE/WebSocket)

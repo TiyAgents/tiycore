@@ -1,19 +1,21 @@
 //! Agent implementation with full conversation loop.
 
+use crate::agent::queue::{MessageQueue, QueuedMessageHandle, QueuedMessageId};
 use crate::agent::{
     AbortSignal, AfterToolCallContext, AfterToolCallFn, AgentConfig, AgentContext, AgentEvent,
     AgentHooks, AgentLoopOptions, AgentMessage, AgentState, AgentStateSnapshot, AgentTool,
-    AgentToolResult, BeforeToolCallContext, BeforeToolCallFn, BeforeToolCallResult, QueueMode,
-    ThinkingBudgets, ToolExecutionMode, ToolExecutor, ToolUpdateCallback, Transport,
+    AgentToolResult, BeforeToolCallContext, BeforeToolCallFn, BeforeToolCallResult, QueueEvent,
+    QueueKind, QueueMode, QueueStats, SupplierContext, ThinkingBudgets, ToolExecutionMode,
+    ToolExecutor, ToolUpdateCallback, Transport,
 };
 use crate::provider::{get_provider, ArcProtocol};
 use crate::stream::{AssistantMessageEventStream, EventStream};
 use crate::thinking::ThinkingLevel;
 use crate::types::*;
 use futures::StreamExt;
-use parking_lot::{Mutex, RwLock};
-use std::collections::{HashMap, VecDeque};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use parking_lot::RwLock;
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -69,6 +71,39 @@ impl Subscribers {
     }
 }
 
+/// Encapsulates the "defer steering until turn end" lifecycle.
+///
+/// When active, steering messages are not consumed mid-stream but deferred
+/// until the current turn completes. This is a single source of truth for
+/// the flag, replacing scattered AtomicBool operations.
+struct SteeringDeferral {
+    active: AtomicBool,
+}
+
+impl SteeringDeferral {
+    fn new() -> Self {
+        Self {
+            active: AtomicBool::new(false),
+        }
+    }
+
+    /// Check whether deferral is currently active (non-modifying).
+    fn is_active(&self) -> bool {
+        self.active.load(Ordering::Acquire)
+    }
+
+    /// Deactivate deferral unconditionally.
+    fn deactivate(&self) {
+        self.active.store(false, Ordering::Release);
+    }
+
+    /// Set deferral state based on whether the queue still has remaining messages.
+    /// If remaining messages exist, stay active; otherwise deactivate.
+    fn activate_if_remaining(&self, has_remaining: bool) {
+        self.active.store(has_remaining, Ordering::Release);
+    }
+}
+
 /// Agent for managing stateful conversations with LLM providers.
 pub struct Agent {
     /// Agent state.
@@ -82,15 +117,17 @@ pub struct Agent {
     /// Maximum turns per prompt.
     max_turns: RwLock<usize>,
     /// Steering message queue.
-    steering_queue: Mutex<VecDeque<AgentMessage>>,
+    steering_queue: MessageQueue,
     /// Follow-up message queue.
-    follow_up_queue: Mutex<VecDeque<AgentMessage>>,
+    follow_up_queue: MessageQueue,
     /// Event subscribers (HashMap-based, no tombstone leak).
     subscribers: Arc<Subscribers>,
     /// Abort flag.
     abort_flag: Arc<AtomicBool>,
     /// When true, queued steering messages are injected only after the current turn ends.
-    defer_steering_until_turn_end: Arc<AtomicBool>,
+    steering_deferral: SteeringDeferral,
+    /// Current turn count within the active run (for SupplierContext).
+    current_turn_count: AtomicUsize,
     /// API key for the provider.
     api_key: RwLock<Option<String>>,
     /// Session ID for caching.
@@ -118,11 +155,12 @@ impl Agent {
             provider: RwLock::new(None),
             hooks: RwLock::new(AgentHooks::default()),
             max_turns: RwLock::new(DEFAULT_MAX_TURNS),
-            steering_queue: Mutex::new(VecDeque::new()),
-            follow_up_queue: Mutex::new(VecDeque::new()),
+            steering_queue: MessageQueue::new(QueueKind::Steering),
+            follow_up_queue: MessageQueue::new(QueueKind::FollowUp),
             subscribers: Arc::new(Subscribers::new()),
             abort_flag: Arc::new(AtomicBool::new(false)),
-            defer_steering_until_turn_end: Arc::new(AtomicBool::new(false)),
+            steering_deferral: SteeringDeferral::new(),
+            current_turn_count: AtomicUsize::new(0),
             api_key: RwLock::new(None),
             session_id: RwLock::new(None),
             run_abort_signal: RwLock::new(None),
@@ -149,11 +187,12 @@ impl Agent {
             provider: RwLock::new(options.provider),
             hooks: RwLock::new(options.hooks),
             max_turns: RwLock::new(options.max_turns.unwrap_or(DEFAULT_MAX_TURNS)),
-            steering_queue: Mutex::new(VecDeque::new()),
-            follow_up_queue: Mutex::new(VecDeque::new()),
+            steering_queue: MessageQueue::new(QueueKind::Steering),
+            follow_up_queue: MessageQueue::new(QueueKind::FollowUp),
             subscribers: Arc::new(Subscribers::new()),
             abort_flag: Arc::new(AtomicBool::new(false)),
-            defer_steering_until_turn_end: Arc::new(AtomicBool::new(false)),
+            steering_deferral: SteeringDeferral::new(),
+            current_turn_count: AtomicUsize::new(0),
             api_key: RwLock::new(options.api_key),
             session_id: RwLock::new(options.session_id),
             run_abort_signal: RwLock::new(None),
@@ -517,6 +556,94 @@ impl Agent {
         self.config.read().follow_up_mode
     }
 
+    /// Set a V2 steering supplier with enriched context.
+    ///
+    /// Takes precedence over the legacy supplier set via `set_get_steering_messages`.
+    /// The supplier receives [`SupplierContext`] with turn count, queue depth, etc.
+    pub fn set_steering_supplier<F, Fut>(&self, supplier: F)
+    where
+        F: Fn(crate::agent::SupplierContext) -> Fut + Send + Sync + 'static,
+        Fut: std::future::Future<Output = Vec<AgentMessage>> + Send + 'static,
+    {
+        let supplier = Arc::new(move |ctx: crate::agent::SupplierContext| {
+            let fut = supplier(ctx);
+            Box::pin(fut)
+                as std::pin::Pin<Box<dyn std::future::Future<Output = Vec<AgentMessage>> + Send>>
+        });
+        self.hooks.write().get_steering_messages_v2 = Some(supplier);
+    }
+
+    /// Set a V2 follow-up supplier with enriched context.
+    ///
+    /// Takes precedence over the legacy supplier set via `set_get_follow_up_messages`.
+    pub fn set_follow_up_supplier<F, Fut>(&self, supplier: F)
+    where
+        F: Fn(crate::agent::SupplierContext) -> Fut + Send + Sync + 'static,
+        Fut: std::future::Future<Output = Vec<AgentMessage>> + Send + 'static,
+    {
+        let supplier = Arc::new(move |ctx: crate::agent::SupplierContext| {
+            let fut = supplier(ctx);
+            Box::pin(fut)
+                as std::pin::Pin<Box<dyn std::future::Future<Output = Vec<AgentMessage>> + Send>>
+        });
+        self.hooks.write().get_follow_up_messages_v2 = Some(supplier);
+    }
+
+    /// Configure backpressure for the steering queue.
+    ///
+    /// Default is `Unlimited` (no restriction). Set to `DropOldest` or `Reject`
+    /// to limit queue growth.
+    pub fn set_steering_backpressure(&self, config: crate::agent::queue::BackpressureConfig) {
+        self.steering_queue.set_backpressure(config);
+    }
+
+    /// Configure backpressure for the follow-up queue.
+    pub fn set_follow_up_backpressure(&self, config: crate::agent::queue::BackpressureConfig) {
+        self.follow_up_queue.set_backpressure(config);
+    }
+
+    /// Try to add a steering message with backpressure awareness.
+    ///
+    /// Returns `Err(QueueFullError)` if the queue is full and overflow behavior
+    /// is `Reject`. Otherwise behaves like `steer()` and returns a cancellation
+    /// handle for the queued message.
+    pub fn try_steer(
+        &self,
+        message: AgentMessage,
+    ) -> Result<QueuedMessageHandle, crate::agent::queue::QueueFullError> {
+        let id = self.steering_queue.try_push(message)?;
+        self.emit_queue_event(QueueEvent::Enqueued {
+            kind: QueueKind::Steering,
+            count: 1,
+            queue_depth: self.steering_queue.len(),
+        });
+        Ok(QueuedMessageHandle {
+            kind: QueueKind::Steering,
+            id,
+        })
+    }
+
+    /// Try to add a follow-up message with backpressure awareness.
+    ///
+    /// Returns `Err(QueueFullError)` if the queue is full and overflow behavior
+    /// is `Reject`. Otherwise behaves like `follow_up()` and returns a
+    /// cancellation handle for the queued message.
+    pub fn try_follow_up(
+        &self,
+        message: AgentMessage,
+    ) -> Result<QueuedMessageHandle, crate::agent::queue::QueueFullError> {
+        let id = self.follow_up_queue.try_push(message)?;
+        self.emit_queue_event(QueueEvent::Enqueued {
+            kind: QueueKind::FollowUp,
+            count: 1,
+            queue_depth: self.follow_up_queue.len(),
+        });
+        Ok(QueuedMessageHandle {
+            kind: QueueKind::FollowUp,
+            id,
+        })
+    }
+
     /// Set custom thinking budgets.
     pub fn set_thinking_budgets(&self, budgets: ThinkingBudgets) {
         self.config.write().thinking_budgets = Some(budgets);
@@ -644,10 +771,9 @@ impl Agent {
     /// Reset the agent.
     pub fn reset(&self) {
         self.state.reset();
-        self.steering_queue.lock().clear();
-        self.follow_up_queue.lock().clear();
-        self.defer_steering_until_turn_end
-            .store(false, Ordering::SeqCst);
+        self.steering_queue.clear();
+        self.follow_up_queue.clear();
+        self.steering_deferral.deactivate();
         *self.session_id.write() = None;
         if let Some(signal) = self.run_abort_signal.write().take() {
             signal.cancel();
@@ -659,23 +785,105 @@ impl Agent {
     // ============================================================================
 
     /// Add a steering message (interrupts current work).
-    pub fn steer(&self, message: AgentMessage) {
-        self.steering_queue.lock().push_back(message);
+    ///
+    /// Returns a handle that can cancel the message while it is still queued.
+    pub fn steer(&self, message: AgentMessage) -> QueuedMessageHandle {
+        let id = self.steering_queue.push(message);
+        self.emit_queue_event(QueueEvent::Enqueued {
+            kind: QueueKind::Steering,
+            count: 1,
+            queue_depth: self.steering_queue.len(),
+        });
+        QueuedMessageHandle {
+            kind: QueueKind::Steering,
+            id,
+        }
     }
 
     /// Add a follow-up message (processed after current work completes).
-    pub fn follow_up(&self, message: AgentMessage) {
-        self.follow_up_queue.lock().push_back(message);
+    ///
+    /// Returns a handle that can cancel the message while it is still queued.
+    pub fn follow_up(&self, message: AgentMessage) -> QueuedMessageHandle {
+        let id = self.follow_up_queue.push(message);
+        self.emit_queue_event(QueueEvent::Enqueued {
+            kind: QueueKind::FollowUp,
+            count: 1,
+            queue_depth: self.follow_up_queue.len(),
+        });
+        QueuedMessageHandle {
+            kind: QueueKind::FollowUp,
+            id,
+        }
+    }
+
+    /// Cancel a queued steering or follow-up message before it is drained.
+    ///
+    /// Returns the removed message if it was still present in the local queue.
+    pub fn cancel_queued_message(&self, handle: QueuedMessageHandle) -> Option<AgentMessage> {
+        match handle.kind {
+            QueueKind::Steering => self.cancel_steering_message(handle.id),
+            QueueKind::FollowUp => self.cancel_follow_up_message(handle.id),
+        }
+    }
+
+    /// Cancel a steering message by id before it is drained.
+    pub fn cancel_steering_message(&self, id: QueuedMessageId) -> Option<AgentMessage> {
+        self.cancel_message_from_queue(QueueKind::Steering, id)
+    }
+
+    /// Cancel a follow-up message by id before it is drained.
+    pub fn cancel_follow_up_message(&self, id: QueuedMessageId) -> Option<AgentMessage> {
+        self.cancel_message_from_queue(QueueKind::FollowUp, id)
+    }
+
+    fn cancel_message_from_queue(
+        &self,
+        kind: QueueKind,
+        id: QueuedMessageId,
+    ) -> Option<AgentMessage> {
+        let (message, remaining) = match kind {
+            QueueKind::Steering => {
+                let message = self.steering_queue.remove(id)?;
+                let remaining = self.steering_queue.len();
+                (message, remaining)
+            }
+            QueueKind::FollowUp => {
+                let message = self.follow_up_queue.remove(id)?;
+                let remaining = self.follow_up_queue.len();
+                (message, remaining)
+            }
+        };
+
+        self.emit_queue_event(QueueEvent::Removed {
+            kind,
+            count: 1,
+            remaining,
+        });
+        Some(message)
     }
 
     /// Clear steering queue.
     pub fn clear_steering_queue(&self) {
-        self.steering_queue.lock().clear();
+        let dropped = self.steering_queue.len();
+        self.steering_queue.clear();
+        if dropped > 0 {
+            self.emit_queue_event(QueueEvent::Cleared {
+                kind: QueueKind::Steering,
+                count_dropped: dropped,
+            });
+        }
     }
 
     /// Clear follow-up queue.
     pub fn clear_follow_up_queue(&self) {
-        self.follow_up_queue.lock().clear();
+        let dropped = self.follow_up_queue.len();
+        self.follow_up_queue.clear();
+        if dropped > 0 {
+            self.emit_queue_event(QueueEvent::Cleared {
+                kind: QueueKind::FollowUp,
+                count_dropped: dropped,
+            });
+        }
     }
 
     /// Clear all queues.
@@ -684,99 +892,226 @@ impl Agent {
         self.clear_follow_up_queue();
     }
 
-    /// Check if there are queued messages.
+    /// Check if there are queued messages in the local buffers.
+    ///
+    /// Note: This only checks the local buffers synchronously. Dynamic suppliers
+    /// are not probed. Use [`has_queued_messages_async()`] to include supplier checks.
     pub fn has_queued_messages(&self) -> bool {
-        !self.steering_queue.lock().is_empty() || !self.follow_up_queue.lock().is_empty()
+        !self.steering_queue.is_empty() || !self.follow_up_queue.is_empty()
+    }
+
+    /// Async check that also probes dynamic suppliers.
+    ///
+    /// If a supplier returns messages, they are cached into the local buffer
+    /// so they won't be lost.
+    pub async fn has_queued_messages_async(&self) -> bool {
+        if self.has_queued_messages() {
+            return true;
+        }
+        let abort = self.current_abort_signal();
+        let (steering_v2, steering_v1, follow_up_v2, follow_up_v1) = {
+            let hooks = self.hooks.read();
+            (
+                hooks.get_steering_messages_v2.clone(),
+                hooks.get_steering_messages.clone(),
+                hooks.get_follow_up_messages_v2.clone(),
+                hooks.get_follow_up_messages.clone(),
+            )
+        };
+
+        // V2 steering supplier (takes precedence over V1)
+        if let Some(v2) = &steering_v2 {
+            let ctx = self.build_supplier_context(QueueKind::Steering);
+            let msgs = v2(ctx).await;
+            if !msgs.is_empty() {
+                self.steering_queue.push_many(msgs);
+                return true;
+            }
+        } else if let Some(s) = &steering_v1 {
+            let msgs = s(abort.clone()).await;
+            if !msgs.is_empty() {
+                self.steering_queue.push_many(msgs);
+                return true;
+            }
+        }
+
+        // V2 follow-up supplier (takes precedence over V1)
+        if let Some(v2) = &follow_up_v2 {
+            let ctx = self.build_supplier_context(QueueKind::FollowUp);
+            let msgs = v2(ctx).await;
+            if !msgs.is_empty() {
+                self.follow_up_queue.push_many(msgs);
+                return true;
+            }
+        } else if let Some(s) = &follow_up_v1 {
+            let msgs = s(abort).await;
+            if !msgs.is_empty() {
+                self.follow_up_queue.push_many(msgs);
+                return true;
+            }
+        }
+
+        false
+    }
+
+    /// Returns current queue depths without consuming anything.
+    pub fn queue_stats(&self) -> QueueStats {
+        QueueStats {
+            steering_depth: self.steering_queue.len(),
+            follow_up_depth: self.follow_up_queue.len(),
+            is_deferring_steering: self.steering_deferral.is_active(),
+        }
+    }
+
+    /// Set a handler for queue lifecycle events (enqueue, consume, clear).
+    ///
+    /// The handler is called synchronously and must not block.
+    pub fn set_on_queue_event<F>(&self, handler: F)
+    where
+        F: Fn(QueueEvent) + Send + Sync + 'static,
+    {
+        self.hooks.write().on_queue_event = Some(Arc::new(handler));
+    }
+
+    /// Fire a queue event to the registered handler (if any).
+    fn emit_queue_event(&self, event: QueueEvent) {
+        if let Some(handler) = &self.hooks.read().on_queue_event {
+            handler(event);
+        }
     }
 
     fn current_abort_signal(&self) -> AbortSignal {
         self.run_abort_signal.read().clone().unwrap_or_default()
     }
 
-    fn dequeue_local_messages(
-        queue: &Mutex<VecDeque<AgentMessage>>,
-        mode: QueueMode,
-    ) -> Vec<AgentMessage> {
-        let mut queue = queue.lock();
-        match mode {
-            QueueMode::All => queue.drain(..).collect(),
-            QueueMode::OneAtATime => {
-                if let Some(first) = queue.pop_front() {
-                    vec![first]
-                } else {
-                    Vec::new()
-                }
-            }
+    /// Build a SupplierContext snapshot for V2 suppliers.
+    fn build_supplier_context(&self, kind: QueueKind) -> SupplierContext {
+        let queue_depth = match kind {
+            QueueKind::Steering => self.steering_queue.len(),
+            QueueKind::FollowUp => self.follow_up_queue.len(),
+        };
+        SupplierContext {
+            abort: self.current_abort_signal(),
+            turn_count: self.current_turn_count.load(Ordering::Acquire),
+            queue_depth,
+            is_streaming: self.state.is_streaming(),
         }
     }
 
-    /// Dequeue steering messages from the local queue only.
+    /// Dequeue steering messages from the local queue only (fast synchronous path).
+    ///
+    /// Used in the stream event loop and sequential tool execution where
+    /// calling an async supplier would block stream processing.
     fn dequeue_steering_messages(&self) -> Vec<AgentMessage> {
         let mode = self.config.read().steering_mode;
-        Self::dequeue_local_messages(&self.steering_queue, mode)
-    }
-
-    async fn poll_queue_messages(
-        &self,
-        mode: QueueMode,
-        local: &Mutex<VecDeque<AgentMessage>>,
-        dynamic: &Option<
-            Arc<
-                dyn Fn(
-                        AbortSignal,
-                    ) -> std::pin::Pin<
-                        Box<dyn std::future::Future<Output = Vec<AgentMessage>> + Send>,
-                    > + Send
-                    + Sync,
-            >,
-        >,
-    ) -> Vec<AgentMessage> {
-        let mut messages = Self::dequeue_local_messages(local, mode);
-        let dynamic_messages = if let Some(callback) = dynamic {
-            callback(self.current_abort_signal()).await
-        } else {
-            Vec::new()
-        };
-
-        match mode {
-            QueueMode::All => {
-                messages.extend(dynamic_messages);
-                messages
-            }
-            QueueMode::OneAtATime => {
-                if messages.is_empty() {
-                    dynamic_messages.into_iter().take(1).collect()
-                } else {
-                    messages.truncate(1);
-                    messages
-                }
-            }
+        let messages = self.steering_queue.drain_local(mode);
+        if !messages.is_empty() {
+            self.emit_queue_event(QueueEvent::Consumed {
+                kind: QueueKind::Steering,
+                count: messages.len(),
+                remaining: self.steering_queue.len(),
+            });
         }
+        messages
     }
 
+    /// Full async poll: local buffer + dynamic supplier, merged per mode.
+    ///
+    /// Uses V2 supplier (with SupplierContext) if set, otherwise falls back to V1.
+    /// Used at turn boundaries (continue_(), deferred steering, follow-up).
     async fn poll_steering_messages(&self) -> Vec<AgentMessage> {
         let mode = self.config.read().steering_mode;
-        let dynamic = self.hooks.read().get_steering_messages.clone();
-        self.poll_queue_messages(mode, &self.steering_queue, &dynamic)
-            .await
+        let (dynamic_v2, dynamic_v1) = {
+            let hooks = self.hooks.read();
+            (
+                hooks.get_steering_messages_v2.clone(),
+                hooks.get_steering_messages.clone(),
+            )
+        };
+
+        // If V2 supplier is set, adapt it to the V1 signature for MessageQueue::drain
+        let effective_supplier = if let Some(v2) = dynamic_v2 {
+            let ctx = self.build_supplier_context(QueueKind::Steering);
+            let adapted: crate::agent::GetQueuedMessagesFn =
+                Arc::new(move |_signal: AbortSignal| {
+                    let ctx = ctx.clone();
+                    let v2 = v2.clone();
+                    Box::pin(async move { v2(ctx).await })
+                        as std::pin::Pin<
+                            Box<dyn std::future::Future<Output = Vec<AgentMessage>> + Send>,
+                        >
+                });
+            Some(adapted)
+        } else {
+            dynamic_v1
+        };
+
+        let messages = self
+            .steering_queue
+            .drain(mode, &effective_supplier, self.current_abort_signal())
+            .await;
+        if !messages.is_empty() {
+            self.emit_queue_event(QueueEvent::Consumed {
+                kind: QueueKind::Steering,
+                count: messages.len(),
+                remaining: self.steering_queue.len(),
+            });
+        }
+        messages
     }
 
+    /// Full async poll for follow-up messages.
+    ///
+    /// Uses V2 supplier (with SupplierContext) if set, otherwise falls back to V1.
     async fn poll_follow_up_messages(&self) -> Vec<AgentMessage> {
         let mode = self.config.read().follow_up_mode;
-        let dynamic = self.hooks.read().get_follow_up_messages.clone();
-        self.poll_queue_messages(mode, &self.follow_up_queue, &dynamic)
-            .await
+        let (dynamic_v2, dynamic_v1) = {
+            let hooks = self.hooks.read();
+            (
+                hooks.get_follow_up_messages_v2.clone(),
+                hooks.get_follow_up_messages.clone(),
+            )
+        };
+
+        let effective_supplier = if let Some(v2) = dynamic_v2 {
+            let ctx = self.build_supplier_context(QueueKind::FollowUp);
+            let adapted: crate::agent::GetQueuedMessagesFn =
+                Arc::new(move |_signal: AbortSignal| {
+                    let ctx = ctx.clone();
+                    let v2 = v2.clone();
+                    Box::pin(async move { v2(ctx).await })
+                        as std::pin::Pin<
+                            Box<dyn std::future::Future<Output = Vec<AgentMessage>> + Send>,
+                        >
+                });
+            Some(adapted)
+        } else {
+            dynamic_v1
+        };
+
+        let messages = self
+            .follow_up_queue
+            .drain(mode, &effective_supplier, self.current_abort_signal())
+            .await;
+        if !messages.is_empty() {
+            self.emit_queue_event(QueueEvent::Consumed {
+                kind: QueueKind::FollowUp,
+                count: messages.len(),
+                remaining: self.follow_up_queue.len(),
+            });
+        }
+        messages
     }
 
     async fn dequeue_deferred_steering_messages(&self) -> Vec<AgentMessage> {
-        if !self.defer_steering_until_turn_end.load(Ordering::SeqCst) {
+        if !self.steering_deferral.is_active() {
             return Vec::new();
         }
 
         let messages = self.poll_steering_messages().await;
-        let still_has_queued = !self.steering_queue.lock().is_empty();
-        self.defer_steering_until_turn_end
-            .store(still_has_queued, Ordering::SeqCst);
+        let still_has_queued = !self.steering_queue.is_empty();
+        self.steering_deferral
+            .activate_if_remaining(still_has_queued);
         messages
     }
 
@@ -1064,7 +1399,7 @@ impl Agent {
             };
 
             // Check for steering messages
-            if !self.defer_steering_until_turn_end.load(Ordering::SeqCst) {
+            if !self.steering_deferral.is_active() {
                 let steering = self.dequeue_steering_messages();
                 if !steering.is_empty() {
                     // Apply steering: add steering messages to state
@@ -1081,7 +1416,7 @@ impl Agent {
                         });
                     }
                     // Abort current turn and restart
-                    return Err(AgentError::Other("Steered".to_string()));
+                    return Err(AgentError::Steered);
                 }
             }
 
@@ -1470,6 +1805,9 @@ impl Agent {
         self.state.set_max_messages(max_messages);
 
         loop {
+            // Publish current turn count for SupplierContext
+            self.current_turn_count.store(turn_count, Ordering::Release);
+
             // Check abort
             if self.abort_flag.load(Ordering::SeqCst) {
                 let error = AgentError::Other("Aborted".to_string());
@@ -1565,12 +1903,6 @@ impl Agent {
                             continue;
                         }
 
-                        // Check for follow-up messages
-                        let follow_ups = self.poll_follow_up_messages().await;
-                        for msg in follow_ups {
-                            self.append_run_message(&mut new_messages, msg, true, true, turn_count);
-                        }
-
                         incomplete_turn_retries = 0;
                         incomplete_turn_retry_started_at = None;
                         turn_count += 1;
@@ -1588,7 +1920,11 @@ impl Agent {
                             StopReason::Error | StopReason::Aborted
                         ) {
                             let agent_error = agent_error_from_assistant(&assistant_msg);
-                            if matches!(agent_error, AgentError::IncompleteStream { .. } | AgentError::TransportError { .. }) {
+                            if matches!(
+                                agent_error,
+                                AgentError::IncompleteStream { .. }
+                                    | AgentError::TransportError { .. }
+                            ) {
                                 let started_at = incomplete_turn_retry_started_at
                                     .get_or_insert_with(Instant::now);
                                 let retry_delay_ms = INCOMPLETE_TURN_RETRY_DELAYS_MS
@@ -1674,7 +2010,7 @@ impl Agent {
                         break;
                     }
                 }
-                Err(AgentError::Other(ref msg)) if msg == "Steered" => {
+                Err(AgentError::Steered) => {
                     incomplete_turn_retries = 0;
                     incomplete_turn_retry_started_at = None;
                     turn_count += 1;
@@ -1822,8 +2158,8 @@ impl Agent {
         if last_is_assistant {
             let steering = self.poll_steering_messages().await;
             if !steering.is_empty() {
-                self.defer_steering_until_turn_end
-                    .store(!self.steering_queue.lock().is_empty(), Ordering::SeqCst);
+                self.steering_deferral
+                    .activate_if_remaining(!self.steering_queue.is_empty());
                 return self.prompt_messages_locked(steering).await;
             }
 
@@ -1842,8 +2178,7 @@ impl Agent {
     /// Abort current operation.
     pub fn abort(&self) {
         self.abort_flag.store(true, Ordering::SeqCst);
-        self.defer_steering_until_turn_end
-            .store(false, Ordering::SeqCst);
+        self.steering_deferral.deactivate();
         if let Some(signal) = self.run_abort_signal.read().clone() {
             signal.cancel();
         }
@@ -2460,7 +2795,7 @@ impl crate::provider::LLMProtocol for DummyProvider {
 }
 
 /// Agent error type.
-#[derive(Debug, Clone, thiserror::Error)]
+#[derive(Debug, Clone, PartialEq, thiserror::Error)]
 pub enum AgentError {
     #[error("Agent is already streaming")]
     AlreadyStreaming,
@@ -2485,6 +2820,11 @@ pub enum AgentError {
 
     #[error("Agent reached the maximum turn limit ({0}) before producing a final response")]
     MaxTurnsReached(usize),
+
+    /// The current turn was interrupted by steering messages.
+    /// This is typed control flow, not a failure.
+    #[error("turn interrupted by steering")]
+    Steered,
 
     #[error("{0}")]
     Other(String),

@@ -277,6 +277,82 @@ pub enum QueueMode {
 }
 
 // ============================================================================
+// Queue Stats
+// ============================================================================
+
+/// Non-consuming snapshot of queue state for observability.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QueueStats {
+    /// Number of messages in the steering queue local buffer.
+    pub steering_depth: usize,
+    /// Number of messages in the follow-up queue local buffer.
+    pub follow_up_depth: usize,
+    /// Whether steering deferral is currently active.
+    pub is_deferring_steering: bool,
+}
+
+// ============================================================================
+// Queue Events (Observability)
+// ============================================================================
+
+/// Queue identity for event reporting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum QueueKind {
+    /// Steering message queue.
+    Steering,
+    /// Follow-up message queue.
+    FollowUp,
+}
+
+/// Lifecycle events emitted by the queue system for observability.
+///
+/// These are fire-and-forget notifications; handlers must not block.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum QueueEvent {
+    /// Messages were added to a queue.
+    Enqueued {
+        /// Which queue received the messages.
+        kind: QueueKind,
+        /// How many messages were added.
+        count: usize,
+        /// Total queue depth after this operation.
+        queue_depth: usize,
+    },
+    /// Messages were consumed from a queue (drained into a turn).
+    Consumed {
+        /// Which queue was drained.
+        kind: QueueKind,
+        /// How many messages were consumed.
+        count: usize,
+        /// Remaining messages in the queue after consumption.
+        remaining: usize,
+    },
+    /// Queue was cleared (all pending messages dropped).
+    Cleared {
+        /// Which queue was cleared.
+        kind: QueueKind,
+        /// How many messages were dropped.
+        count_dropped: usize,
+    },
+    /// Messages were removed from a queue before consumption.
+    Removed {
+        /// Which queue had messages removed.
+        kind: QueueKind,
+        /// How many messages were removed.
+        count: usize,
+        /// Remaining messages in the queue after removal.
+        remaining: usize,
+    },
+}
+
+/// Callback type for queue lifecycle events.
+///
+/// Handlers should be non-blocking and fast; they run synchronously on the
+/// agent's task. Use channels or other async primitives internally if you
+/// need to defer work.
+pub type OnQueueEventFn = Arc<dyn Fn(QueueEvent) + Send + Sync>;
+
+// ============================================================================
 // ThinkingBudgets
 // ============================================================================
 
@@ -506,6 +582,32 @@ pub type GetQueuedMessagesFn = Arc<
         + Sync,
 >;
 
+/// Context provided to V2 dynamic message suppliers.
+///
+/// Enriched with agent state information so suppliers can make informed
+/// decisions about what messages to inject.
+#[derive(Debug, Clone)]
+pub struct SupplierContext {
+    /// Cancellation signal for the current agent run.
+    pub abort: AbortSignal,
+    /// Current turn count within this run.
+    pub turn_count: usize,
+    /// Current queue depth (local buffer, before this supplier call).
+    pub queue_depth: usize,
+    /// Whether the agent is currently streaming a response.
+    pub is_streaming: bool,
+}
+
+/// V2 dynamic message supplier with enriched context.
+///
+/// Preferred over [`GetQueuedMessagesFn`] when the supplier needs to
+/// make decisions based on agent state.
+pub type GetQueuedMessagesFnV2 = Arc<
+    dyn Fn(SupplierContext) -> Pin<Box<dyn std::future::Future<Output = Vec<AgentMessage>> + Send>>
+        + Send
+        + Sync,
+>;
+
 // ============================================================================
 // ToolExecutor
 // ============================================================================
@@ -559,6 +661,12 @@ pub struct AgentHooks {
     pub get_steering_messages: Option<GetQueuedMessagesFn>,
     /// Dynamic follow-up-message supplier.
     pub get_follow_up_messages: Option<GetQueuedMessagesFn>,
+    /// V2 steering supplier with enriched context (takes precedence if set).
+    pub get_steering_messages_v2: Option<GetQueuedMessagesFnV2>,
+    /// V2 follow-up supplier with enriched context (takes precedence if set).
+    pub get_follow_up_messages_v2: Option<GetQueuedMessagesFnV2>,
+    /// Queue lifecycle event observer.
+    pub on_queue_event: Option<OnQueueEventFn>,
 }
 
 /// Additional options for the standalone agent loop APIs.

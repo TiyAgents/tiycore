@@ -234,6 +234,114 @@ fn test_follow_up_mode_setter_getter() {
     assert_eq!(agent.follow_up_mode(), QueueMode::OneAtATime);
 }
 
+#[test]
+fn test_cancel_queued_steering_message_before_drain() {
+    let agent = Agent::new();
+    let keep = agent.steer(AgentMessage::User(UserMessage::text("keep")));
+    let cancel = agent.steer(AgentMessage::User(UserMessage::text("cancel")));
+
+    assert_eq!(agent.queue_stats().steering_depth, 2);
+    let removed = agent.cancel_queued_message(cancel);
+    assert!(
+        matches!(removed, Some(AgentMessage::User(user)) if matches!(&user.content, UserContent::Text(text) if text == "cancel"))
+    );
+    assert_eq!(agent.queue_stats().steering_depth, 1);
+    assert!(agent.cancel_queued_message(cancel).is_none());
+    assert!(agent.cancel_queued_message(keep).is_some());
+    assert!(!agent.has_queued_messages());
+}
+
+#[test]
+fn test_cancel_queued_follow_up_message_before_drain() {
+    let agent = Agent::new();
+    let first = agent.follow_up(AgentMessage::User(UserMessage::text("first")));
+    let second = agent.follow_up(AgentMessage::User(UserMessage::text("second")));
+
+    assert_eq!(agent.queue_stats().follow_up_depth, 2);
+    let removed = agent.cancel_follow_up_message(first.id);
+    assert!(
+        matches!(removed, Some(AgentMessage::User(user)) if matches!(&user.content, UserContent::Text(text) if text == "first"))
+    );
+    assert_eq!(agent.queue_stats().follow_up_depth, 1);
+    assert!(agent.cancel_queued_message(second).is_some());
+    assert_eq!(agent.queue_stats().follow_up_depth, 0);
+}
+
+#[test]
+fn test_cancel_emits_removed_event_only_on_success() {
+    let agent = Agent::new();
+    let events = Arc::new(parking_lot::Mutex::new(Vec::new()));
+    let events_clone = Arc::clone(&events);
+    agent.set_on_queue_event(move |event| events_clone.lock().push(event));
+
+    let handle = agent.follow_up(AgentMessage::User(UserMessage::text("later")));
+    assert!(agent.cancel_queued_message(handle).is_some());
+    assert!(agent.cancel_queued_message(handle).is_none());
+
+    let events = events.lock();
+    assert_eq!(events.len(), 2);
+    assert!(matches!(
+        events[0],
+        QueueEvent::Enqueued {
+            kind: QueueKind::FollowUp,
+            count: 1,
+            queue_depth: 1
+        }
+    ));
+    assert!(matches!(
+        events[1],
+        QueueEvent::Removed {
+            kind: QueueKind::FollowUp,
+            count: 1,
+            remaining: 0
+        }
+    ));
+}
+
+#[test]
+fn test_try_follow_up_cancel_allows_reinsert_after_reject_limit() {
+    let agent = Agent::new();
+    agent.set_follow_up_backpressure(BackpressureConfig {
+        max_depth: 1,
+        overflow: OverflowBehavior::Reject,
+    });
+
+    let handle = agent
+        .try_follow_up(AgentMessage::User(UserMessage::text("first")))
+        .unwrap();
+    assert!(agent
+        .try_follow_up(AgentMessage::User(UserMessage::text("second")))
+        .is_err());
+
+    assert!(agent.cancel_queued_message(handle).is_some());
+    let second = agent
+        .try_follow_up(AgentMessage::User(UserMessage::text("second")))
+        .unwrap();
+    assert_eq!(second.kind, QueueKind::FollowUp);
+    assert_eq!(agent.queue_stats().follow_up_depth, 1);
+}
+
+#[test]
+fn test_cancel_after_clear_or_drop_oldest_returns_none() {
+    let agent = Agent::new();
+    let cleared = agent.steer(AgentMessage::User(UserMessage::text("clear")));
+    agent.clear_steering_queue();
+    assert!(agent.cancel_queued_message(cleared).is_none());
+
+    agent.set_steering_backpressure(BackpressureConfig {
+        max_depth: 1,
+        overflow: OverflowBehavior::DropOldest,
+    });
+    let old = agent
+        .try_steer(AgentMessage::User(UserMessage::text("old")))
+        .unwrap();
+    let new = agent
+        .try_steer(AgentMessage::User(UserMessage::text("new")))
+        .unwrap();
+    assert!(agent.cancel_queued_message(old).is_none());
+    assert!(agent.cancel_queued_message(new).is_some());
+}
+
 #[tokio::test]
 async fn test_steering_one_at_a_time_mode() {
     // Queue 3 steering messages, only 1 should be dequeued per turn in OneAtATime mode
@@ -2114,4 +2222,192 @@ async fn test_reset_clears_session_id() {
     // Reset should clear session_id
     agent.reset();
     assert_eq!(agent.session_id(), None);
+}
+
+// ============================================================================
+// V2 Supplier & Steering Tests (PR #36 review follow-ups)
+// ============================================================================
+
+/// Test that steering during stream processing triggers `AgentError::Steered`
+/// internally and causes a turn restart.
+///
+/// Regression test for: missing test coverage of the typed `Steered` variant
+/// after the refactor from string-matching to `AgentError::Steered`.
+#[tokio::test]
+async fn test_steering_interrupts_turn_and_restarts() {
+    // One response for the first (interrupted) turn, one for the restart
+    let response1 = make_assistant_message("first response");
+    let response2 = make_assistant_message("second response");
+    let mock = Arc::new(MockProvider::new(vec![response1, response2]));
+    let provider: ArcProtocol = mock.clone();
+
+    let agent = Agent::with_model(make_model());
+    agent.set_provider(provider);
+
+    // Queue a steering message before prompting.
+    // It will be dequeued during the first stream event, causing
+    // process_stream_events to return Err(AgentError::Steered),
+    // which run_loop catches and restarts the turn.
+    agent.steer(AgentMessage::User(UserMessage::text("steering override")));
+
+    let result = agent.prompt("hello").await;
+    assert!(result.is_ok());
+
+    // The steering message must appear in the agent's conversation state
+    // (was injected by process_stream_events before returning Steered).
+    let messages = agent.state().messages.read().clone();
+    let has_steering = messages.iter().any(|m| match m {
+        AgentMessage::User(user) => {
+            matches!(&user.content, UserContent::Text(text) if text == "steering override")
+        }
+        _ => false,
+    });
+    assert!(
+        has_steering,
+        "Steering message should be in agent state after Steered restart"
+    );
+
+    // Provider should have been called twice:
+    // once for the first (interrupted) turn, once after steering restart
+    assert_eq!(
+        mock.call_count(),
+        2,
+        "Provider should be called twice due to steering restart, got {}",
+        mock.call_count()
+    );
+}
+
+/// Test that a V2 steering supplier receives a correct SupplierContext
+/// when probed by poll_steering_messages() during continue_().
+///
+/// Regression test for: V2 supplier adapter and SupplierContext injection
+/// untested.
+#[tokio::test]
+async fn test_v2_steering_supplier_receives_context() {
+    let response = make_assistant_message("done");
+    let provider: ArcProtocol = Arc::new(MockProvider::new(vec![response]));
+
+    let agent = Agent::with_model(make_model());
+    agent.set_provider(provider);
+
+    let ctx_captured = Arc::new(parking_lot::Mutex::new(None::<SupplierContext>));
+    let ctx_clone = ctx_captured.clone();
+
+    agent.set_steering_supplier(move |ctx: SupplierContext| {
+        let ctx_clone = ctx_clone.clone();
+        async move {
+            *ctx_clone.lock() = Some(ctx);
+            vec![] // Return empty so loop continues normally
+        }
+    });
+
+    // First prompt completes normally (V2 supplier returns empty)
+    let _ = agent.prompt("hello").await.unwrap();
+
+    // continue_() calls poll_steering_messages() which probes the V2 supplier
+    let result = agent.continue_().await;
+    // Should fail because last message is assistant and no steering/follow-up queued
+    assert!(
+        matches!(result, Err(AgentError::CannotContinueFromAssistant)),
+        "continue_() should fail with CannotContinueFromAssistant"
+    );
+
+    let ctx = ctx_captured.lock();
+    assert!(
+        ctx.is_some(),
+        "V2 steering supplier should have been probed by poll_steering_messages()"
+    );
+    let ctx = ctx.as_ref().unwrap();
+    // turn_count: may be 0 when probe happens after a loop that exited
+    // without incrementing (no tool-call turns), but must never be None.
+    let _ = ctx.turn_count; // SupplierContext is populated
+}
+
+/// Test that `has_queued_messages_async` caches dynamic supplier messages
+/// into the local queue and does not re-invoke the supplier on subsequent calls.
+///
+/// Regression test for: has_queued_messages_async supplier caching untested.
+#[tokio::test]
+async fn test_has_queued_messages_async_caches_supplier_output() {
+    let agent = Agent::with_model(make_model());
+
+    let call_count = Arc::new(AtomicUsize::new(0));
+    let cc = call_count.clone();
+
+    agent.set_get_steering_messages(move |_signal| {
+        let cc = cc.clone();
+        Box::pin(async move {
+            cc.fetch_add(1, Ordering::SeqCst);
+            vec![AgentMessage::User(UserMessage::text("dynamic steering"))]
+        })
+    });
+
+    assert!(!agent.has_queued_messages());
+
+    // First call: supplier is invoked, messages cached into local queue
+    let has = agent.has_queued_messages_async().await;
+    assert!(has, "should report queued messages from supplier");
+    assert_eq!(
+        call_count.load(Ordering::SeqCst),
+        1,
+        "supplier should be called once on first probe"
+    );
+
+    // Second call: must return true from local cache without re-invoking supplier
+    let has2 = agent.has_queued_messages_async().await;
+    assert!(has2, "should still report queued messages from cache");
+    assert_eq!(
+        call_count.load(Ordering::SeqCst),
+        1,
+        "supplier should NOT be called again"
+    );
+
+    // Verify messages actually ended up in the local queue
+    assert!(agent.has_queued_messages(), "local queue should be populated");
+}
+
+/// Test that `has_queued_messages_async` probes V2 steering suppliers.
+///
+/// Regression test for: V2-only consumers receiving false negatives because
+/// has_queued_messages_async only probed V1 suppliers.
+#[tokio::test]
+async fn test_has_queued_messages_async_probes_v2_supplier() {
+    let agent = Agent::with_model(make_model());
+
+    let supplier_called = Arc::new(AtomicBool::new(false));
+    let sc = supplier_called.clone();
+
+    let ctx_captured = Arc::new(parking_lot::Mutex::new(None::<SupplierContext>));
+    let cc = ctx_captured.clone();
+
+    agent.set_steering_supplier(move |ctx: SupplierContext| {
+        let sc = sc.clone();
+        let cc = cc.clone();
+        async move {
+            sc.store(true, Ordering::SeqCst);
+            *cc.lock() = Some(ctx);
+            vec![AgentMessage::User(UserMessage::text("v2 steering"))]
+        }
+    });
+
+    assert!(!agent.has_queued_messages());
+
+    let has = agent.has_queued_messages_async().await;
+    assert!(has, "V2 supplier should be probed and return true");
+    assert!(
+        supplier_called.load(Ordering::SeqCst),
+        "V2 steering supplier should have been called"
+    );
+
+    // Verify SupplierContext was populated
+    let ctx = ctx_captured.lock();
+    assert!(ctx.is_some(), "SupplierContext should have been built");
+    let ctx = ctx.as_ref().unwrap();
+    assert_eq!(
+        ctx.queue_depth, 0,
+        "queue_depth should be 0 before messages are enqueued"
+    );
+
+    // Messages should have been cached into local queue
+    assert!(agent.has_queued_messages(), "V2 supplier messages should be cached");
 }

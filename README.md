@@ -16,6 +16,8 @@
 
 tiycore is a Rust library that provides a single, provider-agnostic interface for streaming LLM completions and running agentic tool-use loops. Write your application logic once, then swap between OpenAI, Anthropic, Google, Ollama, and 8+ other providers by changing a config value.
 
+<img width="2752" height="1536" alt="image" src="https://github.com/user-attachments/assets/f3d29f85-0ef0-4674-a159-4760e1876780" />
+
 ## Highlights
 
 - **One interface, many providers** — 5 protocol-level implementations (OpenAI Completions, OpenAI Responses, Anthropic Messages, Google Generative AI / Vertex AI, Ollama) and 10 delegation providers (OpenAI-Compatible, xAI, Groq, OpenRouter, DeepSeek, MiniMax, Kimi Coding, ZAI, Zenmux, OpenCode Go) behind a single `LLMProtocol` trait.
