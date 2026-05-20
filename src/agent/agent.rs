@@ -909,22 +909,48 @@ impl Agent {
             return true;
         }
         let abort = self.current_abort_signal();
-        let steering_supplier = self.hooks.read().get_steering_messages.clone();
-        if let Some(s) = &steering_supplier {
+        let (steering_v2, steering_v1, follow_up_v2, follow_up_v1) = {
+            let hooks = self.hooks.read();
+            (
+                hooks.get_steering_messages_v2.clone(),
+                hooks.get_steering_messages.clone(),
+                hooks.get_follow_up_messages_v2.clone(),
+                hooks.get_follow_up_messages.clone(),
+            )
+        };
+
+        // V2 steering supplier (takes precedence over V1)
+        if let Some(v2) = &steering_v2 {
+            let ctx = self.build_supplier_context(QueueKind::Steering);
+            let msgs = v2(ctx).await;
+            if !msgs.is_empty() {
+                self.steering_queue.push_many(msgs);
+                return true;
+            }
+        } else if let Some(s) = &steering_v1 {
             let msgs = s(abort.clone()).await;
             if !msgs.is_empty() {
                 self.steering_queue.push_many(msgs);
                 return true;
             }
         }
-        let follow_up_supplier = self.hooks.read().get_follow_up_messages.clone();
-        if let Some(s) = &follow_up_supplier {
+
+        // V2 follow-up supplier (takes precedence over V1)
+        if let Some(v2) = &follow_up_v2 {
+            let ctx = self.build_supplier_context(QueueKind::FollowUp);
+            let msgs = v2(ctx).await;
+            if !msgs.is_empty() {
+                self.follow_up_queue.push_many(msgs);
+                return true;
+            }
+        } else if let Some(s) = &follow_up_v1 {
             let msgs = s(abort).await;
             if !msgs.is_empty() {
                 self.follow_up_queue.push_many(msgs);
                 return true;
             }
         }
+
         false
     }
 
