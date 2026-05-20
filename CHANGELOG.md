@@ -4,6 +4,18 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.7] - 2026-05-20
+### :sparkles: New Features
+- [`a8e9403`](https://github.com/tiylabs/tiycore/commit/a8e9403da19e8926e29d55481357a7877c775079) - **events**: ✨ Add retry visibility event *(PR [#34](https://github.com/tiylabs/tiycore/pull/34) by [@jorben](https://github.com/jorben))*
+- [`f2e56a6`](https://github.com/tiylabs/tiycore/commit/f2e56a6cf8b1f0007af8d6388260f5298b93cc6c) - **agent**: ✨ Add unified message queue system *(PR [#36](https://github.com/tiylabs/tiycore/pull/36) by [@jorben](https://github.com/jorben))*
+
+### :bug: Bug Fixes
+- [`8be2b5e`](https://github.com/tiylabs/tiycore/commit/8be2b5ec0ea58acc1ad5369d5cead7dd9e6c0547) - **protocol**: 🐛 Support xhigh for GPT-5.2+ models *(PR [#33](https://github.com/tiylabs/tiycore/pull/33) by [@HayWolf](https://github.com/HayWolf))*
+
+### :wrench: Chores
+- [`588cb01`](https://github.com/tiylabs/tiycore/commit/588cb01ac3bab69963a8e8d43b402d5b10ee6474) - **catalog**: 🔧 update GitHub Pages URLs after org rename *(PR [#35](https://github.com/tiylabs/tiycore/pull/35) by [@HayWolf](https://github.com/HayWolf))*
+
+
 ## [0.2.6] - 2026-05-15
 ### :recycle: Refactors
 - [`8454585`](https://github.com/tiylabs/tiycore/commit/84545850c360507ca1c3ca4ad305d69c8bbe907d) - ♻️ restructure OpenAICompletionsCompat into semantic sub-structs *(PR [#31](https://github.com/tiylabs/tiycore/pull/31) by [@jorben](https://github.com/jorben))*
@@ -278,3 +290,4 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 [0.2.3]: https://github.com/TiyAgents/tiycore/compare/0.2.2...0.2.3
 [0.2.5]: https://github.com/TiyAgents/tiycore/compare/0.2.3...0.2.5
 [0.2.6]: https://github.com/tiylabs/tiycore/compare/0.2.5...0.2.6
+[0.2.7]: https://github.com/tiylabs/tiycore/compare/0.2.6...0.2.7
