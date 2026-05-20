@@ -334,6 +334,15 @@ pub enum QueueEvent {
         /// How many messages were dropped.
         count_dropped: usize,
     },
+    /// Messages were removed from a queue before consumption.
+    Removed {
+        /// Which queue had messages removed.
+        kind: QueueKind,
+        /// How many messages were removed.
+        count: usize,
+        /// Remaining messages in the queue after removal.
+        remaining: usize,
+    },
 }
 
 /// Callback type for queue lifecycle events.
@@ -594,9 +603,7 @@ pub struct SupplierContext {
 /// Preferred over [`GetQueuedMessagesFn`] when the supplier needs to
 /// make decisions based on agent state.
 pub type GetQueuedMessagesFnV2 = Arc<
-    dyn Fn(
-            SupplierContext,
-        ) -> Pin<Box<dyn std::future::Future<Output = Vec<AgentMessage>> + Send>>
+    dyn Fn(SupplierContext) -> Pin<Box<dyn std::future::Future<Output = Vec<AgentMessage>> + Send>>
         + Send
         + Sync,
 >;

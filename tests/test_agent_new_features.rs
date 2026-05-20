@@ -234,6 +234,114 @@ fn test_follow_up_mode_setter_getter() {
     assert_eq!(agent.follow_up_mode(), QueueMode::OneAtATime);
 }
 
+#[test]
+fn test_cancel_queued_steering_message_before_drain() {
+    let agent = Agent::new();
+    let keep = agent.steer(AgentMessage::User(UserMessage::text("keep")));
+    let cancel = agent.steer(AgentMessage::User(UserMessage::text("cancel")));
+
+    assert_eq!(agent.queue_stats().steering_depth, 2);
+    let removed = agent.cancel_queued_message(cancel);
+    assert!(
+        matches!(removed, Some(AgentMessage::User(user)) if matches!(&user.content, UserContent::Text(text) if text == "cancel"))
+    );
+    assert_eq!(agent.queue_stats().steering_depth, 1);
+    assert!(agent.cancel_queued_message(cancel).is_none());
+    assert!(agent.cancel_queued_message(keep).is_some());
+    assert!(!agent.has_queued_messages());
+}
+
+#[test]
+fn test_cancel_queued_follow_up_message_before_drain() {
+    let agent = Agent::new();
+    let first = agent.follow_up(AgentMessage::User(UserMessage::text("first")));
+    let second = agent.follow_up(AgentMessage::User(UserMessage::text("second")));
+
+    assert_eq!(agent.queue_stats().follow_up_depth, 2);
+    let removed = agent.cancel_follow_up_message(first.id);
+    assert!(
+        matches!(removed, Some(AgentMessage::User(user)) if matches!(&user.content, UserContent::Text(text) if text == "first"))
+    );
+    assert_eq!(agent.queue_stats().follow_up_depth, 1);
+    assert!(agent.cancel_queued_message(second).is_some());
+    assert_eq!(agent.queue_stats().follow_up_depth, 0);
+}
+
+#[test]
+fn test_cancel_emits_removed_event_only_on_success() {
+    let agent = Agent::new();
+    let events = Arc::new(parking_lot::Mutex::new(Vec::new()));
+    let events_clone = Arc::clone(&events);
+    agent.set_on_queue_event(move |event| events_clone.lock().push(event));
+
+    let handle = agent.follow_up(AgentMessage::User(UserMessage::text("later")));
+    assert!(agent.cancel_queued_message(handle).is_some());
+    assert!(agent.cancel_queued_message(handle).is_none());
+
+    let events = events.lock();
+    assert_eq!(events.len(), 2);
+    assert!(matches!(
+        events[0],
+        QueueEvent::Enqueued {
+            kind: QueueKind::FollowUp,
+            count: 1,
+            queue_depth: 1
+        }
+    ));
+    assert!(matches!(
+        events[1],
+        QueueEvent::Removed {
+            kind: QueueKind::FollowUp,
+            count: 1,
+            remaining: 0
+        }
+    ));
+}
+
+#[test]
+fn test_try_follow_up_cancel_allows_reinsert_after_reject_limit() {
+    let agent = Agent::new();
+    agent.set_follow_up_backpressure(BackpressureConfig {
+        max_depth: 1,
+        overflow: OverflowBehavior::Reject,
+    });
+
+    let handle = agent
+        .try_follow_up(AgentMessage::User(UserMessage::text("first")))
+        .unwrap();
+    assert!(agent
+        .try_follow_up(AgentMessage::User(UserMessage::text("second")))
+        .is_err());
+
+    assert!(agent.cancel_queued_message(handle).is_some());
+    let second = agent
+        .try_follow_up(AgentMessage::User(UserMessage::text("second")))
+        .unwrap();
+    assert_eq!(second.kind, QueueKind::FollowUp);
+    assert_eq!(agent.queue_stats().follow_up_depth, 1);
+}
+
+#[test]
+fn test_cancel_after_clear_or_drop_oldest_returns_none() {
+    let agent = Agent::new();
+    let cleared = agent.steer(AgentMessage::User(UserMessage::text("clear")));
+    agent.clear_steering_queue();
+    assert!(agent.cancel_queued_message(cleared).is_none());
+
+    agent.set_steering_backpressure(BackpressureConfig {
+        max_depth: 1,
+        overflow: OverflowBehavior::DropOldest,
+    });
+    let old = agent
+        .try_steer(AgentMessage::User(UserMessage::text("old")))
+        .unwrap();
+    let new = agent
+        .try_steer(AgentMessage::User(UserMessage::text("new")))
+        .unwrap();
+    assert!(agent.cancel_queued_message(old).is_none());
+    assert!(agent.cancel_queued_message(new).is_some());
+}
+
 #[tokio::test]
 async fn test_steering_one_at_a_time_mode() {
     // Queue 3 steering messages, only 1 should be dequeued per turn in OneAtATime mode

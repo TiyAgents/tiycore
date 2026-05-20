@@ -1,5 +1,6 @@
 //! Agent implementation with full conversation loop.
 
+use crate::agent::queue::{MessageQueue, QueuedMessageHandle, QueuedMessageId};
 use crate::agent::{
     AbortSignal, AfterToolCallContext, AfterToolCallFn, AgentConfig, AgentContext, AgentEvent,
     AgentHooks, AgentLoopOptions, AgentMessage, AgentState, AgentStateSnapshot, AgentTool,
@@ -7,7 +8,6 @@ use crate::agent::{
     QueueKind, QueueMode, QueueStats, SupplierContext, ThinkingBudgets, ToolExecutionMode,
     ToolExecutor, ToolUpdateCallback, Transport,
 };
-use crate::agent::queue::MessageQueue;
 use crate::provider::{get_provider, ArcProtocol};
 use crate::stream::{AssistantMessageEventStream, EventStream};
 use crate::thinking::ThinkingLevel;
@@ -605,18 +605,43 @@ impl Agent {
     /// Try to add a steering message with backpressure awareness.
     ///
     /// Returns `Err(QueueFullError)` if the queue is full and overflow behavior
-    /// is `Reject`. Otherwise behaves like `steer()`.
+    /// is `Reject`. Otherwise behaves like `steer()` and returns a cancellation
+    /// handle for the queued message.
     pub fn try_steer(
         &self,
         message: AgentMessage,
-    ) -> Result<(), crate::agent::queue::QueueFullError> {
-        self.steering_queue.try_push(message)?;
+    ) -> Result<QueuedMessageHandle, crate::agent::queue::QueueFullError> {
+        let id = self.steering_queue.try_push(message)?;
         self.emit_queue_event(QueueEvent::Enqueued {
             kind: QueueKind::Steering,
             count: 1,
             queue_depth: self.steering_queue.len(),
         });
-        Ok(())
+        Ok(QueuedMessageHandle {
+            kind: QueueKind::Steering,
+            id,
+        })
+    }
+
+    /// Try to add a follow-up message with backpressure awareness.
+    ///
+    /// Returns `Err(QueueFullError)` if the queue is full and overflow behavior
+    /// is `Reject`. Otherwise behaves like `follow_up()` and returns a
+    /// cancellation handle for the queued message.
+    pub fn try_follow_up(
+        &self,
+        message: AgentMessage,
+    ) -> Result<QueuedMessageHandle, crate::agent::queue::QueueFullError> {
+        let id = self.follow_up_queue.try_push(message)?;
+        self.emit_queue_event(QueueEvent::Enqueued {
+            kind: QueueKind::FollowUp,
+            count: 1,
+            queue_depth: self.follow_up_queue.len(),
+        });
+        Ok(QueuedMessageHandle {
+            kind: QueueKind::FollowUp,
+            id,
+        })
     }
 
     /// Set custom thinking budgets.
@@ -760,23 +785,81 @@ impl Agent {
     // ============================================================================
 
     /// Add a steering message (interrupts current work).
-    pub fn steer(&self, message: AgentMessage) {
-        self.steering_queue.push(message);
+    ///
+    /// Returns a handle that can cancel the message while it is still queued.
+    pub fn steer(&self, message: AgentMessage) -> QueuedMessageHandle {
+        let id = self.steering_queue.push(message);
         self.emit_queue_event(QueueEvent::Enqueued {
             kind: QueueKind::Steering,
             count: 1,
             queue_depth: self.steering_queue.len(),
         });
+        QueuedMessageHandle {
+            kind: QueueKind::Steering,
+            id,
+        }
     }
 
     /// Add a follow-up message (processed after current work completes).
-    pub fn follow_up(&self, message: AgentMessage) {
-        self.follow_up_queue.push(message);
+    ///
+    /// Returns a handle that can cancel the message while it is still queued.
+    pub fn follow_up(&self, message: AgentMessage) -> QueuedMessageHandle {
+        let id = self.follow_up_queue.push(message);
         self.emit_queue_event(QueueEvent::Enqueued {
             kind: QueueKind::FollowUp,
             count: 1,
             queue_depth: self.follow_up_queue.len(),
         });
+        QueuedMessageHandle {
+            kind: QueueKind::FollowUp,
+            id,
+        }
+    }
+
+    /// Cancel a queued steering or follow-up message before it is drained.
+    ///
+    /// Returns the removed message if it was still present in the local queue.
+    pub fn cancel_queued_message(&self, handle: QueuedMessageHandle) -> Option<AgentMessage> {
+        match handle.kind {
+            QueueKind::Steering => self.cancel_steering_message(handle.id),
+            QueueKind::FollowUp => self.cancel_follow_up_message(handle.id),
+        }
+    }
+
+    /// Cancel a steering message by id before it is drained.
+    pub fn cancel_steering_message(&self, id: QueuedMessageId) -> Option<AgentMessage> {
+        self.cancel_message_from_queue(QueueKind::Steering, id)
+    }
+
+    /// Cancel a follow-up message by id before it is drained.
+    pub fn cancel_follow_up_message(&self, id: QueuedMessageId) -> Option<AgentMessage> {
+        self.cancel_message_from_queue(QueueKind::FollowUp, id)
+    }
+
+    fn cancel_message_from_queue(
+        &self,
+        kind: QueueKind,
+        id: QueuedMessageId,
+    ) -> Option<AgentMessage> {
+        let (message, remaining) = match kind {
+            QueueKind::Steering => {
+                let message = self.steering_queue.remove(id)?;
+                let remaining = self.steering_queue.len();
+                (message, remaining)
+            }
+            QueueKind::FollowUp => {
+                let message = self.follow_up_queue.remove(id)?;
+                let remaining = self.follow_up_queue.len();
+                (message, remaining)
+            }
+        };
+
+        self.emit_queue_event(QueueEvent::Removed {
+            kind,
+            count: 1,
+            remaining,
+        });
+        Some(message)
     }
 
     /// Clear steering queue.
@@ -1794,12 +1877,6 @@ impl Agent {
                             continue;
                         }
 
-                        // Check for follow-up messages
-                        let follow_ups = self.poll_follow_up_messages().await;
-                        for msg in follow_ups {
-                            self.append_run_message(&mut new_messages, msg, true, true, turn_count);
-                        }
-
                         incomplete_turn_retries = 0;
                         incomplete_turn_retry_started_at = None;
                         turn_count += 1;
@@ -1817,7 +1894,11 @@ impl Agent {
                             StopReason::Error | StopReason::Aborted
                         ) {
                             let agent_error = agent_error_from_assistant(&assistant_msg);
-                            if matches!(agent_error, AgentError::IncompleteStream { .. } | AgentError::TransportError { .. }) {
+                            if matches!(
+                                agent_error,
+                                AgentError::IncompleteStream { .. }
+                                    | AgentError::TransportError { .. }
+                            ) {
                                 let started_at = incomplete_turn_retry_started_at
                                     .get_or_insert_with(Instant::now);
                                 let retry_delay_ms = INCOMPLETE_TURN_RETRY_DELAYS_MS

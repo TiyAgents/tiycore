@@ -1633,7 +1633,9 @@ fn incomplete_anthropic_stream_detail(
     if (!saw_message_delta || !saw_message_stop)
         && !block_types.is_empty()
         && open_blocks.is_empty()
-        && partial_tool_args.values().all(|args| args.trim().is_empty())
+        && partial_tool_args
+            .values()
+            .all(|args| args.trim().is_empty())
         && line_buffer.trim().is_empty()
     {
         return None;

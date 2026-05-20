@@ -842,7 +842,10 @@ mod tests {
     #[test]
     fn test_parse_transport_stream_error_returns_none_for_non_transport() {
         assert!(parse_transport_stream_error("Provider error: something").is_none());
-        assert!(parse_transport_stream_error("[incomplete_stream]anthropic: missing message_stop").is_none());
+        assert!(
+            parse_transport_stream_error("[incomplete_stream]anthropic: missing message_stop")
+                .is_none()
+        );
     }
 
     #[test]

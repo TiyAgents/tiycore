@@ -10,6 +10,9 @@ pub use agent::{
     agent_loop, agent_loop_continue, run_agent_loop, run_agent_loop_continue, Agent, AgentError,
     AgentEventStream, SubscriberId,
 };
-pub use queue::{BackpressureConfig, DrainStrategy, OverflowBehavior, QueueFullError};
+pub use queue::{
+    BackpressureConfig, DrainStrategy, OverflowBehavior, QueueFullError, QueuedMessageHandle,
+    QueuedMessageId,
+};
 pub use state::{AgentState, AgentStateSnapshot};
 pub use types::*;

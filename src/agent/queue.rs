@@ -7,6 +7,39 @@
 use crate::agent::{AbortSignal, AgentMessage, GetQueuedMessagesFn, QueueKind, QueueMode};
 use parking_lot::Mutex;
 use std::collections::VecDeque;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+// ============================================================================
+// Queued message identity
+// ============================================================================
+
+/// Stable identifier for a message while it remains in a local agent queue.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct QueuedMessageId(u64);
+
+impl QueuedMessageId {
+    /// Return the raw numeric identifier.
+    pub fn as_u64(self) -> u64 {
+        self.0
+    }
+}
+
+/// Handle returned when a message is enqueued.
+///
+/// It can be used to cancel the message before it is drained from the queue.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct QueuedMessageHandle {
+    /// Which queue owns this handle.
+    pub kind: QueueKind,
+    /// Queue-local message identifier.
+    pub id: QueuedMessageId,
+}
+
+#[derive(Debug, Clone)]
+struct QueuedMessageItem {
+    id: QueuedMessageId,
+    message: AgentMessage,
+}
 
 // ============================================================================
 // DrainStrategy trait
@@ -159,9 +192,10 @@ impl std::error::Error for QueueFullError {}
 /// - `drain()` is async (calls supplier) and should be used at turn boundaries.
 /// - The Mutex critical section is nanosecond-scale (VecDeque ops only).
 pub(crate) struct MessageQueue {
-    buffer: Mutex<VecDeque<AgentMessage>>,
+    buffer: Mutex<VecDeque<QueuedMessageItem>>,
     kind: QueueKind,
     backpressure: Mutex<BackpressureConfig>,
+    next_id: AtomicU64,
 }
 
 impl MessageQueue {
@@ -171,6 +205,18 @@ impl MessageQueue {
             buffer: Mutex::new(VecDeque::new()),
             kind,
             backpressure: Mutex::new(BackpressureConfig::default()),
+            next_id: AtomicU64::new(1),
+        }
+    }
+
+    fn next_message_id(&self) -> QueuedMessageId {
+        QueuedMessageId(self.next_id.fetch_add(1, Ordering::Relaxed))
+    }
+
+    fn make_item(&self, message: AgentMessage) -> QueuedMessageItem {
+        QueuedMessageItem {
+            id: self.next_message_id(),
+            message,
         }
     }
 
@@ -180,9 +226,12 @@ impl MessageQueue {
         self.kind
     }
 
-    /// Push a single message into the queue.
-    pub fn push(&self, message: AgentMessage) {
-        self.buffer.lock().push_back(message);
+    /// Push a single message into the queue and return its queue-local id.
+    pub fn push(&self, message: AgentMessage) -> QueuedMessageId {
+        let item = self.make_item(message);
+        let id = item.id;
+        self.buffer.lock().push_back(item);
+        id
     }
 
     /// Push multiple messages into the queue.
@@ -193,22 +242,25 @@ impl MessageQueue {
     #[allow(dead_code)]
     pub fn push_many(&self, messages: impl IntoIterator<Item = AgentMessage>) {
         let mut buf = self.buffer.lock();
-        buf.extend(messages);
+        buf.extend(messages.into_iter().map(|message| self.make_item(message)));
     }
 
     /// Try to push a message, respecting backpressure configuration.
     ///
-    /// Returns `Ok(())` if the message was accepted, or `Err(QueueFullError)`
-    /// if the queue is full and overflow behavior is `Reject`.
+    /// Returns the queue-local id if the message was accepted, or
+    /// `Err(QueueFullError)` if the queue is full and overflow behavior is
+    /// `Reject`.
     ///
     /// With `DropOldest`, oldest messages are evicted to make room.
     /// With `Unlimited`, always succeeds (equivalent to `push()`).
-    pub fn try_push(&self, message: AgentMessage) -> Result<(), QueueFullError> {
+    pub fn try_push(&self, message: AgentMessage) -> Result<QueuedMessageId, QueueFullError> {
         let bp = self.backpressure.lock().clone();
+        let item = self.make_item(message);
+        let id = item.id;
         if bp.max_depth == 0 || bp.overflow == OverflowBehavior::Unlimited {
             // No limit
-            self.buffer.lock().push_back(message);
-            return Ok(());
+            self.buffer.lock().push_back(item);
+            return Ok(id);
         }
 
         let mut buf = self.buffer.lock();
@@ -227,8 +279,8 @@ impl MessageQueue {
                 OverflowBehavior::Unlimited => unreachable!(),
             }
         }
-        buf.push_back(message);
-        Ok(())
+        buf.push_back(item);
+        Ok(id)
     }
 
     /// Set the backpressure configuration.
@@ -244,11 +296,16 @@ impl MessageQueue {
 
     /// Drain using a custom strategy (instead of QueueMode).
     ///
-    /// This allows pluggable consumption logic beyond All/OneAtATime.
+    /// This allows pluggable consumption logic beyond All/OneAtATime. Custom
+    /// strategies operate on bare messages, so retained messages are requeued
+    /// with fresh internal ids.
     #[allow(dead_code)]
     pub fn drain_with_strategy(&self, strategy: &dyn DrainStrategy) -> Vec<AgentMessage> {
         let mut buf = self.buffer.lock();
-        strategy.select(&mut buf)
+        let mut messages: VecDeque<AgentMessage> = buf.drain(..).map(|item| item.message).collect();
+        let selected = strategy.select(&mut messages);
+        buf.extend(messages.into_iter().map(|message| self.make_item(message)));
+        selected
     }
 
     /// Synchronous drain from local buffer only (no supplier call).
@@ -259,10 +316,10 @@ impl MessageQueue {
     pub fn drain_local(&self, mode: QueueMode) -> Vec<AgentMessage> {
         let mut buf = self.buffer.lock();
         match mode {
-            QueueMode::All => buf.drain(..).collect(),
+            QueueMode::All => buf.drain(..).map(|item| item.message).collect(),
             QueueMode::OneAtATime => {
                 if let Some(first) = buf.pop_front() {
-                    vec![first]
+                    vec![first.message]
                 } else {
                     Vec::new()
                 }
@@ -319,6 +376,15 @@ impl MessageQueue {
     /// Returns the number of messages in the local buffer.
     pub fn len(&self) -> usize {
         self.buffer.lock().len()
+    }
+
+    /// Remove a queued message by id.
+    ///
+    /// Returns `Some(message)` only if the message is still in the local buffer.
+    pub fn remove(&self, id: QueuedMessageId) -> Option<AgentMessage> {
+        let mut buf = self.buffer.lock();
+        let index = buf.iter().position(|item| item.id == id)?;
+        buf.remove(index).map(|item| item.message)
     }
 
     /// Clear all messages from the local buffer.
@@ -408,6 +474,69 @@ mod tests {
         let err = q.try_push(make_msg("d")).unwrap_err();
         assert_eq!(err.current_depth, 3);
         assert_eq!(err.max_depth, 1);
+    }
+
+    #[test]
+    fn test_remove_by_id_before_drain() {
+        let q = MessageQueue::new(QueueKind::Steering);
+        let id_a = q.push(make_msg("a"));
+        let id_b = q.push(make_msg("b"));
+        let id_c = q.push(make_msg("c"));
+
+        let removed = q.remove(id_b);
+        assert_eq!(removed, Some(make_msg("b")));
+        assert_eq!(q.len(), 2);
+
+        let drained = q.drain_local(QueueMode::All);
+        assert_eq!(drained, vec![make_msg("a"), make_msg("c")]);
+        assert!(q.remove(id_a).is_none());
+        assert!(q.remove(id_c).is_none());
+    }
+
+    #[test]
+    fn test_remove_unknown_id_returns_none() {
+        let q = MessageQueue::new(QueueKind::FollowUp);
+        let id = q.push(make_msg("a"));
+        assert_eq!(q.remove(QueuedMessageId(id.as_u64() + 1)), None);
+        assert_eq!(q.len(), 1);
+    }
+
+    #[test]
+    fn test_remove_after_drain_returns_none() {
+        let q = MessageQueue::new(QueueKind::Steering);
+        let id = q.push(make_msg("a"));
+        assert_eq!(q.drain_local(QueueMode::All), vec![make_msg("a")]);
+        assert!(q.remove(id).is_none());
+    }
+
+    #[test]
+    fn test_reject_then_remove_then_accept() {
+        let q = MessageQueue::new(QueueKind::FollowUp);
+        q.set_backpressure(BackpressureConfig {
+            max_depth: 1,
+            overflow: OverflowBehavior::Reject,
+        });
+
+        let id = q.try_push(make_msg("a")).unwrap();
+        assert!(q.try_push(make_msg("b")).is_err());
+        assert_eq!(q.remove(id), Some(make_msg("a")));
+        assert!(q.try_push(make_msg("b")).is_ok());
+        assert_eq!(q.drain_local(QueueMode::All), vec![make_msg("b")]);
+    }
+
+    #[test]
+    fn test_drop_oldest_makes_old_handle_uncancellable() {
+        let q = MessageQueue::new(QueueKind::Steering);
+        q.set_backpressure(BackpressureConfig {
+            max_depth: 1,
+            overflow: OverflowBehavior::DropOldest,
+        });
+
+        let old_id = q.try_push(make_msg("old")).unwrap();
+        let new_id = q.try_push(make_msg("new")).unwrap();
+        assert!(q.remove(old_id).is_none());
+        assert_eq!(q.remove(new_id), Some(make_msg("new")));
+        assert!(q.is_empty());
     }
 
     #[tokio::test]
