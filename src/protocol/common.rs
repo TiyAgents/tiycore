@@ -326,7 +326,7 @@ pub fn is_retryable_status(status: reqwest::StatusCode) -> bool {
 
 /// Check whether a `reqwest::Error` represents a transient failure worth retrying.
 pub fn is_retryable_error(err: &reqwest::Error) -> bool {
-    err.is_timeout() || err.is_connect()
+    err.is_timeout() || err.is_connect() || err.is_request()
 }
 
 /// Check whether a streamed response body error is transient and worth retrying.
